@@ -1,0 +1,942 @@
+'use strict';
+
+/* ========== 資料存放（只存在這支手機的瀏覽器裡） ========== */
+
+const CARDS_KEY = 'ec.cards.v1';
+const SETTINGS_KEY = 'ec.settings.v1';
+const DAY = 24 * 60 * 60 * 1000;
+const MIN = 60 * 1000;
+
+const DEFAULT_SETTINGS = {
+  listenSource: 'due', // due | all | flagged
+  zhTimes: 1,
+  enTimes: 3,
+  gap: 2,
+  enRate: 0.9,
+  lastBackup: 0,
+};
+
+function loadJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+let cards = loadJSON(CARDS_KEY, []);
+let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(SETTINGS_KEY, {}));
+
+function saveCards() {
+  try {
+    localStorage.setItem(CARDS_KEY, JSON.stringify(cards));
+  } catch (e) {
+    toast('儲存失敗：手機空間不足或瀏覽器不允許儲存');
+  }
+}
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (e) { /* 忽略 */ }
+}
+
+function newId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function getCard(id) {
+  return cards.find((c) => c.id === id);
+}
+
+function upsertCard(card) {
+  card.updated = Date.now();
+  const i = cards.findIndex((c) => c.id === card.id);
+  if (i >= 0) cards[i] = card; else cards.unshift(card);
+  saveCards();
+}
+
+function deleteCard(id) {
+  cards = cards.filter((c) => c.id !== id);
+  saveCards();
+}
+
+function blankCard(type) {
+  const now = Date.now();
+  return {
+    id: newId(), type: type || 'word', en: '', zh: '', context: '', source: '', note: '',
+    created: now, updated: now, due: now, interval: 0, ease: 2.5, reps: 0, lapses: 0, flagged: false,
+  };
+}
+
+/* ========== 間隔重複（簡化版 SM-2） ========== */
+
+function nextState(card, grade) {
+  const c = Object.assign({}, card);
+  const now = Date.now();
+  if (grade === 'again') {
+    c.reps = 0;
+    c.lapses = (c.lapses || 0) + 1;
+    c.interval = 0;
+    c.ease = Math.max(1.3, c.ease - 0.2);
+    c.due = now + 10 * MIN;
+  } else if (grade === 'hard') {
+    c.interval = Math.max(1, Math.round((c.interval || 1) * 1.2));
+    c.ease = Math.max(1.3, c.ease - 0.15);
+    c.due = now + c.interval * DAY;
+  } else {
+    if (c.reps === 0) c.interval = 1;
+    else if (c.reps === 1) c.interval = 4;
+    else c.interval = Math.round(c.interval * c.ease);
+    c.reps += 1;
+    c.due = now + c.interval * DAY;
+  }
+  return c;
+}
+
+function describeWait(card, grade) {
+  if (grade === 'again') return '10 分鐘後';
+  const d = nextState(card, grade).interval;
+  if (d <= 1) return '明天';
+  if (d < 30) return d + ' 天後';
+  return Math.round(d / 30) + ' 個月後';
+}
+
+function dueCards() {
+  const now = Date.now();
+  return cards.filter((c) => c.due <= now).sort((a, b) => a.due - b.due);
+}
+
+/* ========== 語音：朗讀與辨識 ========== */
+
+const synth = window.speechSynthesis;
+let voices = [];
+function refreshVoices() { voices = synth ? synth.getVoices() : []; }
+if (synth) {
+  refreshVoices();
+  synth.addEventListener && synth.addEventListener('voiceschanged', refreshVoices);
+}
+
+function pickVoice(lang) {
+  const prefs = lang === 'zh' ? ['zh-TW', 'zh-HK', 'zh-CN', 'zh'] : ['en-US', 'en-GB', 'en'];
+  for (const p of prefs) {
+    const v = voices.find((x) => x.lang && x.lang.replace('_', '-').startsWith(p));
+    if (v) return v;
+  }
+  return null;
+}
+
+function speak(text, lang, rate) {
+  return new Promise((resolve) => {
+    if (!synth || !text) return resolve();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = lang === 'zh' ? 'zh-TW' : 'en-US';
+    const v = pickVoice(lang);
+    if (v) u.voice = v;
+    u.rate = rate || 1;
+    u.onend = () => resolve();
+    u.onerror = () => resolve();
+    synth.speak(u);
+  });
+}
+
+function stopSpeaking() {
+  if (synth) synth.cancel();
+}
+
+const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let activeRecognition = null;
+
+function recognize(lang) {
+  return new Promise((resolve, reject) => {
+    if (!Recognition) {
+      reject(new Error('unsupported'));
+      return;
+    }
+    stopSpeaking();
+    const r = new Recognition();
+    r.lang = lang === 'zh' ? 'zh-TW' : 'en-US';
+    r.interimResults = false;
+    r.maxAlternatives = 1;
+    let text = '';
+    r.onresult = (e) => { text = Array.from(e.results).map((x) => x[0].transcript).join(' '); };
+    r.onerror = (e) => { activeRecognition = null; reject(new Error(e.error || 'error')); };
+    r.onend = () => { activeRecognition = null; resolve(text.trim()); };
+    activeRecognition = r;
+    r.start();
+  });
+}
+
+// 按下麥克風按鈕：開始聽，結果交給 onText；再按一次可提早結束
+function micButton(btn, lang, onText) {
+  btn.addEventListener('click', async () => {
+    if (activeRecognition) { activeRecognition.stop(); return; }
+    btn.classList.add('listening');
+    try {
+      const text = await recognize(lang);
+      if (text) onText(text);
+      else toast('沒有聽到聲音，再試一次');
+    } catch (e) {
+      if (e.message === 'unsupported') toast('這個瀏覽器不支援語音輸入，請改用鍵盤上的麥克風');
+      else if (e.message === 'not-allowed') toast('請允許網頁使用麥克風');
+      else toast('語音辨識失敗，請再試一次');
+    } finally {
+      btn.classList.remove('listening');
+    }
+  });
+}
+
+/* ========== 小工具 ========== */
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+function sleep(ms, token) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      if (token && token.cancelled) return resolve();
+      if (Date.now() - start >= ms) return resolve();
+      setTimeout(tick, 100);
+    };
+    tick();
+  });
+}
+
+const TYPE_LABEL = { word: '單字', phrase: '片語', sentence: '句子' };
+
+const ICON = {
+  back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>',
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>',
+  speaker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+  gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4z"/></svg>',
+  headphones: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14v-2a8 8 0 0 1 16 0v2"/><rect x="3" y="14" width="4" height="6" rx="1.5"/><rect x="17" y="14" width="4" height="6" rx="1.5"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg>',
+  list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
+  play: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>',
+  pause: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>',
+  prev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 5v14M19 5L9 12l10 7V5z"/></svg>',
+  next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 5v14M5 5l10 7-10 7V5z"/></svg>',
+};
+
+const app = document.getElementById('app');
+
+function topbar(title, backHash, backIcon) {
+  return `<div class="topbar">
+    <a class="icon-btn plain" href="${backHash || '#'}" aria-label="返回">${backIcon || ICON.back}</a>
+    <h1>${esc(title)}</h1>
+    <span style="width:44px"></span>
+  </div>`;
+}
+
+/* ========== 路由 ========== */
+
+let leaveView = null;
+
+function route() {
+  if (leaveView) { leaveView(); leaveView = null; }
+  document.body.classList.remove('dark');
+  const hash = location.hash.replace(/^#/, '');
+  const [path, query] = hash.split('?');
+  const parts = path.split('/');
+  const params = new URLSearchParams(query || '');
+  window.scrollTo(0, 0);
+  switch (parts[0]) {
+    case 'add': return viewEdit(null, params);
+    case 'edit': return viewEdit(parts[1], params);
+    case 'review': return viewReview(params);
+    case 'translate': return viewTranslate();
+    case 'listen': return viewListen();
+    case 'cards': return viewCards();
+    case 'settings': return viewSettings();
+    default: return viewHome();
+  }
+}
+window.addEventListener('hashchange', route);
+
+function go(hash) {
+  if (location.hash === hash) route(); else location.hash = hash;
+}
+
+/* ========== 首頁 ========== */
+
+function viewHome() {
+  const due = dueCards().length;
+  const minutes = Math.max(1, Math.round(due / 3));
+  const recent = cards.slice().sort((a, b) => b.created - a.created).slice(0, 5);
+  const needBackup = cards.length > 0 && Date.now() - (settings.lastBackup || 0) > 7 * DAY;
+  const d = new Date();
+  const week = '日一二三四五六'[d.getDay()];
+
+  app.innerHTML = `
+    <div class="row between">
+      <div class="stack" style="gap:2px">
+        <span class="muted">${d.getMonth() + 1} 月 ${d.getDate()} 日 星期${week}</span>
+        <h1>今天也來練英文</h1>
+      </div>
+      <a class="icon-btn" href="#settings" aria-label="設定與備份">${ICON.gear}</a>
+    </div>
+
+    ${needBackup ? `<a class="card" href="#settings" style="text-decoration:none;background:var(--warn-soft);color:var(--warn)">已超過 7 天沒備份，點這裡匯出備份，避免資料遺失。</a>` : ''}
+
+    <section class="hero">
+      <span>今天要複習</span>
+      <div class="row" style="align-items:baseline"><span class="count">${due}</span><span>張卡片${due ? '・約 ' + minutes + ' 分鐘' : ''}</span></div>
+      <a class="btn" href="#review?restart=1">${due ? '開始複習' : '今天的複習完成了'}</a>
+      <a class="btn outline" href="#listen">${ICON.headphones}用聽的（連續播放）</a>
+    </section>
+
+    <div class="grid2">
+      <a class="tile" href="#add">${ICON.plus}<strong>新增卡片</strong><span class="muted">單字、句子、出處</span></a>
+      <a class="tile" href="#translate">${ICON.mic}<strong>中文怎麼說</strong><span class="muted">講中文，學英文說法</span></a>
+    </div>
+
+    <div class="row between">
+      <h2>最近收集</h2>
+      <a href="#cards" class="muted">全部 ${cards.length} 張 ›</a>
+    </div>
+    <div class="stack">
+      ${recent.length ? recent.map(listItem).join('') : '<div class="empty">還沒有卡片。按「新增卡片」記下第一個單字吧。</div>'}
+    </div>
+  `;
+  bindListItems();
+}
+
+function listItem(c) {
+  const tagClass = c.type === 'sentence' ? 'tag sentence' : 'tag';
+  return `<button class="list-item" data-id="${esc(c.id)}">
+    <span class="row"><span class="en">${esc(c.en || '（未填英文）')}</span><span class="${tagClass}">${TYPE_LABEL[c.type] || '單字'}</span>${c.flagged ? '<span class="tag grey">不熟</span>' : ''}</span>
+    <span class="sub">${esc(c.zh)}${c.source ? '・' + esc(c.source) : ''}</span>
+  </button>`;
+}
+
+function bindListItems() {
+  app.querySelectorAll('.list-item').forEach((el) => {
+    el.addEventListener('click', () => go('#edit/' + el.dataset.id + '?back=' + encodeURIComponent(location.hash || '#')));
+  });
+}
+
+/* ========== 全部卡片 ========== */
+
+function viewCards() {
+  app.innerHTML = `
+    ${topbar('全部卡片', '#')}
+    <input type="search" id="q" placeholder="搜尋英文、中文或出處" aria-label="搜尋">
+    <div class="stack" id="list"></div>
+  `;
+  const q = app.querySelector('#q');
+  const list = app.querySelector('#list');
+  const draw = () => {
+    const k = q.value.trim().toLowerCase();
+    const items = cards
+      .filter((c) => !k || [c.en, c.zh, c.source, c.note, c.context].join(' ').toLowerCase().includes(k))
+      .sort((a, b) => b.created - a.created);
+    list.innerHTML = items.length ? items.map(listItem).join('') : '<div class="empty">找不到卡片</div>';
+    bindListItems();
+  };
+  q.addEventListener('input', draw);
+  draw();
+}
+
+/* ========== 新增／編輯卡片 ========== */
+
+function viewEdit(id, params) {
+  const existing = id ? getCard(id) : null;
+  if (id && !existing) { go('#'); return; }
+  const card = existing ? Object.assign({}, existing) : blankCard(params.get('type'));
+  if (!existing) {
+    if (params.get('en')) card.en = params.get('en');
+    if (params.get('zh')) card.zh = params.get('zh');
+    if (params.get('note')) card.note = params.get('note');
+  }
+  const back = params.get('back') || '#';
+
+  app.innerHTML = `
+    ${topbar(existing ? '編輯卡片' : '新增卡片', back)}
+    <div class="seg" role="group" aria-label="卡片類型">
+      ${['word', 'phrase', 'sentence'].map((t) => `<button type="button" data-type="${t}" class="${card.type === t ? 'on' : ''}">${TYPE_LABEL[t]}</button>`).join('')}
+    </div>
+
+    <label class="field">英文
+      <span class="field-row">
+        <input type="text" id="en" class="big-en" autocomplete="off" autocapitalize="off" value="${esc(card.en)}">
+        <button type="button" class="icon-btn" id="mic-en" aria-label="用說的輸入英文">${ICON.mic}</button>
+        <button type="button" class="icon-btn" id="say-en" aria-label="播放英文發音">${ICON.speaker}</button>
+      </span>
+    </label>
+
+    <label class="field">中文意思
+      <span class="field-row">
+        <input type="text" id="zh" value="${esc(card.zh)}">
+        <button type="button" class="icon-btn" id="mic-zh" aria-label="用說的輸入中文">${ICON.mic}</button>
+      </span>
+    </label>
+
+    <label class="field">看到的原句（上下文）
+      <textarea id="context">${esc(card.context)}</textarea>
+    </label>
+
+    <label class="field">出處
+      <input type="text" id="source" placeholder="網站、影片、書名或網址" value="${esc(card.source)}">
+    </label>
+
+    <label class="field">我的筆記
+      <textarea id="note" style="min-height:60px">${esc(card.note)}</textarea>
+    </label>
+
+    <label class="row" style="min-height:44px"><input type="checkbox" id="flagged" ${card.flagged ? 'checked' : ''} style="width:22px;height:22px">標記為「還不熟」</label>
+
+    <div class="spacer"></div>
+    <button class="btn" id="save">${existing ? '儲存修改' : '存成卡片'}</button>
+    ${existing ? '<button class="btn danger" id="delete">刪除這張卡片</button>' : ''}
+  `;
+
+  const $ = (s) => app.querySelector(s);
+  app.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => {
+    card.type = b.dataset.type;
+    app.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x === b));
+  }));
+  micButton($('#mic-en'), 'en', (t) => { $('#en').value = t; });
+  micButton($('#mic-zh'), 'zh', (t) => { $('#zh').value = t; });
+  $('#say-en').addEventListener('click', () => { stopSpeaking(); speak($('#en').value.trim(), 'en', settings.enRate); });
+
+  $('#save').addEventListener('click', () => {
+    card.en = $('#en').value.trim();
+    card.zh = $('#zh').value.trim();
+    card.context = $('#context').value.trim();
+    card.source = $('#source').value.trim();
+    card.note = $('#note').value.trim();
+    card.flagged = $('#flagged').checked;
+    if (!card.en) { toast('請先填英文'); return; }
+    upsertCard(card);
+    toast(existing ? '已儲存' : '已新增，今天就會出現在複習裡');
+    if (existing) go(back);
+    else go('#add?type=' + card.type + '&back=' + encodeURIComponent(back));
+  });
+
+  if (existing) {
+    $('#delete').addEventListener('click', () => {
+      if (!confirm('確定要刪除這張卡片嗎？')) return;
+      deleteCard(card.id);
+      if (review) review.queue = review.queue.filter((x) => x !== card.id);
+      toast('已刪除');
+      go(back);
+    });
+  }
+}
+
+/* ========== 每日複習 ========== */
+
+let review = null; // { queue: [id], index, revealed, said, total }
+
+function normWords(s) {
+  return String(s || '').toLowerCase().replace(/[’']/g, '').replace(/[^a-z0-9\s-]/g, ' ').split(/\s+/).filter(Boolean);
+}
+
+function markSaid(said, answer) {
+  const target = new Set(normWords(answer));
+  return said.split(/\s+/).filter(Boolean).map((w) => {
+    const n = normWords(w)[0];
+    return n && !target.has(n) ? `<mark>${esc(w)}</mark>` : esc(w);
+  }).join(' ');
+}
+
+function viewReview(params) {
+  if (!review || params.get('restart') === '1' || review.index >= review.queue.length) {
+    const queue = dueCards().map((c) => c.id);
+    review = { queue, index: 0, revealed: false, said: '', total: queue.length };
+  }
+  drawReview();
+}
+
+function drawReview() {
+  // 跳過已被刪除的卡片
+  while (review.index < review.queue.length && !getCard(review.queue[review.index])) review.index++;
+
+  if (review.index >= review.queue.length) {
+    const done = review.total;
+    review = null;
+    app.innerHTML = `
+      ${topbar('每日複習', '#', ICON.close)}
+      <div class="empty"><h2 style="color:var(--ink)">${done ? '今天的複習完成了' : '今天沒有要複習的卡片'}</h2>
+      <p>${done ? '辛苦了。想多練習的話，可以用「連續播放」再聽一輪。' : '新增卡片後，它會馬上出現在這裡。'}</p></div>
+      <a class="btn secondary" href="#listen">${ICON.headphones}用聽的（連續播放）</a>
+      <a class="btn" href="#">回首頁</a>
+    `;
+    return;
+  }
+
+  const card = getCard(review.queue[review.index]);
+  const askZh = !!card.zh; // 有中文就看中文說英文；沒有就看英文回想意思
+  const pct = Math.round((review.index / review.queue.length) * 100);
+  const back = encodeURIComponent('#review');
+
+  app.innerHTML = `
+    <div class="row">
+      <a class="icon-btn plain" href="#" aria-label="結束複習">${ICON.close}</a>
+      <div class="progress"><div style="width:${pct}%"></div></div>
+      <span class="muted">${review.index + 1} / ${review.queue.length}</span>
+    </div>
+
+    <section class="card">
+      <div class="row between">
+        <span class="${card.type === 'sentence' ? 'tag sentence' : 'tag'}">${TYPE_LABEL[card.type] || '單字'}・${askZh ? '用講的' : '想意思'}</span>
+        <a class="btn ghost" style="min-height:36px;font-size:13px;padding:0 12px" href="#edit/${esc(card.id)}?back=${back}">${ICON.edit}編輯</a>
+      </div>
+      <span class="muted">${askZh ? '請用英文說：' : '這是什麼意思？'}</span>
+      <div class="prompt-zh">${esc(askZh ? card.zh : card.en)}</div>
+    </section>
+
+    ${review.said ? `<section class="card"><span class="muted">你剛剛說的</span><div class="said">${markSaid(review.said, card.en)}</div></section>` : ''}
+
+    ${review.revealed ? `
+      <section class="card answer">
+        <div class="row between">
+          <span style="font-size:13px">參考答案</span>
+          <span class="row">
+            <button class="icon-btn" id="play" aria-label="播放" style="background:var(--accent);border-color:var(--accent);color:#fff">${ICON.speaker}</button>
+            <button class="btn ghost" id="slow" style="min-height:44px;font-size:14px;padding:0 14px">慢速</button>
+          </span>
+        </div>
+        <div class="answer-en">${esc(card.en)}</div>
+        ${!askZh && card.zh ? `<div>${esc(card.zh)}</div>` : ''}
+        ${card.context ? `<div style="font-size:14px">原句：${esc(card.context)}</div>` : ''}
+        ${card.source || card.note ? `<div style="font-size:13px">${card.source ? '出處：' + esc(card.source) : ''}${card.source && card.note ? '・' : ''}${card.note ? '筆記：' + esc(card.note) : ''}</div>` : ''}
+      </section>` : ''}
+
+    <div class="spacer"></div>
+
+    ${askZh ? `<div class="stack" style="align-items:center">
+      <button class="icon-btn big dark" id="speak" aria-label="開口說英文">${ICON.mic}</button>
+      <span class="muted">${review.said ? '再講一次' : '按下後開口說英文'}</span>
+    </div>` : ''}
+
+    ${review.revealed ? `
+      <div class="grid3 grade">
+        <button class="again" data-g="again"><strong>忘了</strong><span>${describeWait(card, 'again')}</span></button>
+        <button data-g="hard"><strong>模糊</strong><span>${describeWait(card, 'hard')}</span></button>
+        <button class="good" data-g="good"><strong>記得</strong><span>${describeWait(card, 'good')}</span></button>
+      </div>` : `<button class="btn secondary" id="reveal">看答案</button>`}
+  `;
+
+  const $ = (s) => app.querySelector(s);
+  if ($('#reveal')) $('#reveal').addEventListener('click', () => {
+    review.revealed = true;
+    drawReview();
+    speak(card.en, 'en', settings.enRate);
+  });
+  if ($('#play')) $('#play').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', settings.enRate); });
+  if ($('#slow')) $('#slow').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', 0.6); });
+  if ($('#speak')) micButton($('#speak'), 'en', (t) => {
+    const firstTry = !review.revealed;
+    review.said = t;
+    review.revealed = true;
+    drawReview();
+    if (firstTry) speak(card.en, 'en', settings.enRate);
+  });
+  app.querySelectorAll('.grade button').forEach((b) => b.addEventListener('click', () => {
+    stopSpeaking();
+    const updated = nextState(card, b.dataset.g);
+    upsertCard(updated);
+    if (b.dataset.g === 'again') review.queue.push(card.id); // 這輪結束前再出現一次
+    review.index++;
+    review.revealed = false;
+    review.said = '';
+    drawReview();
+  }));
+}
+
+/* ========== 中文怎麼說 ========== */
+
+let translateDraft = { zh: '', pasted: '', options: [], tip: '', picked: -1 };
+
+function buildPrompt(zh) {
+  return `我想用英文表達下面這句中文，請給我三種自然的英文說法：口語、一般、正式。
+請只用以下格式回覆，每種一行，不要加其他說明或符號：
+口語：（英文）
+一般：（英文）
+正式：（英文）
+重點：（用繁體中文，一兩句說明最值得學的用字）
+
+中文：${zh}`;
+}
+
+function parseAnswer(text) {
+  const options = [];
+  let tip = '';
+  text.split(/\n+/).forEach((line) => {
+    const m = line.replace(/[*_#>`]/g, '').trim().match(/^(口語|一般|正式|重點)\s*[:：]\s*(.+)$/);
+    if (!m) return;
+    if (m[1] === '重點') tip = m[2].trim();
+    else options.push({ style: m[1], en: m[2].trim() });
+  });
+  return { options, tip };
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+    ta.remove();
+    return ok;
+  }
+}
+
+function viewTranslate() {
+  const d = translateDraft;
+  app.innerHTML = `
+    ${topbar('中文怎麼說', '#')}
+
+    <div class="step"><b>1</b>說出你想表達的中文</div>
+    <div class="field-row">
+      <textarea id="zh" placeholder="例如：我最近工作很忙，忙到沒時間運動。" aria-label="中文" style="min-height:70px">${esc(d.zh)}</textarea>
+      <button class="icon-btn dark" id="mic" aria-label="用說的輸入中文">${ICON.mic}</button>
+    </div>
+
+    <div class="step"><b>2</b>複製問題，到 Claude 貼上</div>
+    <button class="btn secondary" id="ask">${ICON.copy}複製並打開 Claude</button>
+
+    <div class="step"><b>3</b>把 Claude 的回答整段貼回來</div>
+    <textarea id="pasted" placeholder="長按這裡 → 貼上" aria-label="貼上 Claude 的回答">${esc(d.pasted)}</textarea>
+
+    <div class="stack" id="options"></div>
+    <div class="spacer"></div>
+    <button class="btn" id="save" ${d.picked < 0 ? 'disabled' : ''}>存成卡片，之後練習</button>
+  `;
+
+  const $ = (s) => app.querySelector(s);
+  const drawOptions = () => {
+    const box = $('#options');
+    if (!d.pasted.trim()) { box.innerHTML = ''; return; }
+    if (!d.options.length) {
+      box.innerHTML = '<div class="muted">看不懂這段回答的格式。你也可以直接到「新增卡片」手動輸入。</div>';
+      return;
+    }
+    box.innerHTML = d.options.map((o, i) => `
+      <button class="card selectable ${d.picked === i ? 'selected' : ''}" data-i="${i}">
+        <span class="row between"><span class="${i === 0 ? 'tag' : 'tag grey'}">${esc(o.style)}</span>${d.picked === i ? '<span style="color:var(--accent);font-weight:700;font-size:13px">已選</span>' : ''}</span>
+        <span style="font-size:16px;font-weight:${d.picked === i ? 700 : 400}">${esc(o.en)}</span>
+      </button>`).join('') + (d.tip ? `<div class="card" style="font-size:14px">重點：${esc(d.tip)}</div>` : '');
+    box.querySelectorAll('[data-i]').forEach((b) => b.addEventListener('click', () => {
+      d.picked = Number(b.dataset.i);
+      $('#save').disabled = false;
+      drawOptions();
+      speak(d.options[d.picked].en, 'en', settings.enRate);
+    }));
+  };
+
+  $('#zh').addEventListener('input', (e) => { d.zh = e.target.value; });
+  micButton($('#mic'), 'zh', (t) => { d.zh = t; $('#zh').value = t; });
+
+  $('#ask').addEventListener('click', async () => {
+    const zh = $('#zh').value.trim();
+    if (!zh) { toast('請先說或輸入中文'); return; }
+    d.zh = zh;
+    const prompt = buildPrompt(zh);
+    // 先開視窗再等複製結果，避免手機瀏覽器擋掉彈出視窗
+    const copying = copyText(prompt);
+    window.open('https://claude.ai/new?q=' + encodeURIComponent(prompt), '_blank');
+    const ok = await copying;
+    toast(ok ? '已複製，如果 Claude 沒有自動帶入，貼上後送出' : '複製失敗，請手動複製');
+  });
+
+  $('#pasted').addEventListener('input', (e) => {
+    d.pasted = e.target.value;
+    const r = parseAnswer(d.pasted);
+    d.options = r.options;
+    d.tip = r.tip;
+    d.picked = d.options.length ? 0 : -1;
+    $('#save').disabled = d.picked < 0;
+    drawOptions();
+  });
+
+  $('#save').addEventListener('click', () => {
+    const o = d.options[d.picked];
+    if (!o) return;
+    const card = blankCard('sentence');
+    card.en = o.en;
+    card.zh = d.zh.trim();
+    card.source = '中文怎麼說';
+    card.note = o.style + (d.tip ? '・' + d.tip : '');
+    upsertCard(card);
+    translateDraft = { zh: '', pasted: '', options: [], tip: '', picked: -1 };
+    toast('已存成卡片');
+    viewTranslate();
+  });
+
+  drawOptions();
+}
+
+/* ========== 連續播放 ========== */
+
+let player = null; // { list:[id], index, enDone, phase, playing, token }
+let wakeLock = null;
+let listenSettingsOpen = false;
+
+async function lockScreenOn() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) { wakeLock = null; }
+}
+function releaseScreen() {
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && player && player.playing) lockScreenOn();
+});
+
+function buildPlaylist() {
+  let list;
+  if (settings.listenSource === 'flagged') list = cards.filter((c) => c.flagged);
+  else if (settings.listenSource === 'all') list = cards.slice().sort((a, b) => b.created - a.created);
+  else list = dueCards();
+  return list.map((c) => c.id);
+}
+
+function viewListen() {
+  document.body.classList.add('dark');
+  // 離開畫面時會暫停，所以每次進來都依最新卡片重建清單
+  player = { list: buildPlaylist(), index: 0, enDone: 0, phase: 'idle', playing: false, token: null };
+  leaveView = () => { pausePlayer(); releaseScreen(); };
+  drawListen();
+}
+
+function drawListen() {
+  const p = player;
+  const card = getCard(p.list[p.index]);
+  const total = p.list.length;
+  const nextCard = getCard(p.list[p.index + 1]);
+  const dots = Array.from({ length: settings.enTimes }, (_, i) => `<span class="${i < p.enDone ? 'on' : ''}"></span>`).join('');
+  const opt = (v, cur, label) => `<option value="${v}" ${String(v) === String(cur) ? 'selected' : ''}>${label}</option>`;
+
+  app.innerHTML = `
+    <div class="listen stack" style="gap:18px;flex-grow:1">
+      <div class="topbar">
+        <a class="icon-btn plain" href="#" aria-label="返回首頁">${ICON.back}</a>
+        <h1>連續播放</h1>
+        <span class="label" style="width:44px;text-align:right">${total ? (p.index + 1) + ' / ' + total : ''}</span>
+      </div>
+
+      <details id="listen-settings" ${total && !listenSettingsOpen ? '' : 'open'}>
+        <summary class="label" style="min-height:32px">播放設定：${{ due: '今日複習', all: '全部卡片', flagged: '不熟的卡片' }[settings.listenSource]}・中文 ${settings.zhTimes} 次・英文 ${settings.enTimes} 次・間隔 ${settings.gap} 秒</summary>
+        <div class="grid2" style="margin-top:10px">
+          <label class="field">播哪些卡片<select id="s-src">${opt('due', settings.listenSource, '今日複習')}${opt('all', settings.listenSource, '全部卡片')}${opt('flagged', settings.listenSource, '不熟的卡片')}</select></label>
+          <label class="field">英文速度<select id="s-rate">${opt(0.7, settings.enRate, '慢')}${opt(0.9, settings.enRate, '稍慢')}${opt(1, settings.enRate, '正常')}</select></label>
+          <label class="field">中文唸幾次<select id="s-zh">${[0, 1, 2].map((n) => opt(n, settings.zhTimes, n + ' 次')).join('')}</select></label>
+          <label class="field">英文唸幾次<select id="s-en">${[1, 2, 3, 4, 5].map((n) => opt(n, settings.enTimes, n + ' 次')).join('')}</select></label>
+          <label class="field">每句間隔<select id="s-gap">${[1, 2, 3, 5].map((n) => opt(n, settings.gap, n + ' 秒')).join('')}</select></label>
+        </div>
+      </details>
+
+      ${card ? `
+        <div class="stack" style="gap:24px;flex-grow:1;justify-content:center">
+          <div class="stack"><span class="label">中文</span><div class="zh">${esc(card.zh || '（沒有中文）')}</div></div>
+          <div class="stack" style="gap:10px">
+            <span class="label">英文${p.phase === 'en' ? '・正在播第 ' + Math.min(p.enDone + 1, settings.enTimes) + ' 次' : ''}</span>
+            <div class="en">${esc(card.en)}</div>
+            <div class="dots">${dots}</div>
+          </div>
+          <span class="label">${nextCard ? '下一張：' + esc(nextCard.en) : '這是最後一張'}</span>
+        </div>
+
+        <div class="row" style="justify-content:center;gap:28px">
+          <button class="icon-btn side" id="prev" aria-label="上一張">${ICON.prev}</button>
+          <button class="icon-btn play" id="toggle" aria-label="${p.playing ? '暫停' : '播放'}">${p.playing ? ICON.pause : ICON.play}</button>
+          <button class="icon-btn side" id="next" aria-label="下一張">${ICON.next}</button>
+        </div>
+        <button class="btn ghost ${card.flagged ? 'on' : ''}" id="flag">${card.flagged ? '已標記為不熟（再按取消）' : '這張還不熟，標記起來'}</button>
+      ` : `<div class="empty" style="color:#B9CCCF">這個清單裡沒有卡片。<br>換個「播哪些卡片」試試看。</div>`}
+    </div>
+  `;
+
+  const $ = (s) => app.querySelector(s);
+  const onSetting = (sel, key, num) => $(sel).addEventListener('change', (e) => {
+    settings[key] = num ? Number(e.target.value) : e.target.value;
+    saveSettings();
+    if (key === 'listenSource') {
+      pausePlayer();
+      player = { list: buildPlaylist(), index: 0, enDone: 0, phase: 'idle', playing: false, token: null };
+    }
+    drawListen();
+  });
+  $('#listen-settings').addEventListener('toggle', (e) => { listenSettingsOpen = e.target.open; });
+  onSetting('#s-src', 'listenSource');
+  onSetting('#s-rate', 'enRate', true);
+  onSetting('#s-zh', 'zhTimes', true);
+  onSetting('#s-en', 'enTimes', true);
+  onSetting('#s-gap', 'gap', true);
+
+  if (!card) return;
+  $('#toggle').addEventListener('click', () => { if (p.playing) { pausePlayer(); drawListen(); } else startPlayer(); });
+  $('#prev').addEventListener('click', () => jump(-1));
+  $('#next').addEventListener('click', () => jump(1));
+  $('#flag').addEventListener('click', () => {
+    const c = getCard(p.list[p.index]);
+    if (!c) return;
+    c.flagged = !c.flagged;
+    upsertCard(c);
+    drawListen();
+  });
+}
+
+function pausePlayer() {
+  if (!player) return;
+  if (player.token) player.token.cancelled = true;
+  player.token = null;
+  player.playing = false;
+  player.phase = 'idle';
+  stopSpeaking();
+}
+
+function jump(delta) {
+  const wasPlaying = player.playing;
+  pausePlayer();
+  player.index = Math.max(0, Math.min(player.list.length - 1, player.index + delta));
+  player.enDone = 0;
+  if (wasPlaying) startPlayer(); else drawListen();
+}
+
+async function startPlayer() {
+  const p = player;
+  if (!p.list.length) return;
+  pausePlayer();
+  const token = { cancelled: false };
+  p.token = token;
+  p.playing = true;
+  lockScreenOn();
+  // 從目前這張的開頭重新播
+  p.enDone = 0;
+
+  while (!token.cancelled && p.index < p.list.length) {
+    const card = getCard(p.list[p.index]);
+    if (!card) { p.index++; continue; }
+
+    p.phase = 'zh';
+    drawListen();
+    for (let i = 0; i < settings.zhTimes && card.zh && !token.cancelled; i++) {
+      await speak(card.zh, 'zh', 1);
+      await sleep(700, token);
+    }
+    p.phase = 'en';
+    for (let i = 0; i < settings.enTimes && !token.cancelled; i++) {
+      drawListen();
+      await speak(card.en, 'en', settings.enRate);
+      if (token.cancelled) break;
+      p.enDone = i + 1;
+      drawListen();
+      await sleep(i < settings.enTimes - 1 ? 900 : settings.gap * 1000, token);
+    }
+    if (token.cancelled) return;
+    if (p.index >= p.list.length - 1) break;
+    p.index++;
+    p.enDone = 0;
+  }
+
+  if (!token.cancelled) {
+    p.playing = false;
+    p.phase = 'idle';
+    releaseScreen();
+    toast('播完了');
+    drawListen();
+  }
+}
+
+/* ========== 設定與備份 ========== */
+
+function viewSettings() {
+  const last = settings.lastBackup ? new Date(settings.lastBackup).toLocaleString('zh-TW') : '從未備份';
+  const voiceInfo = Recognition ? '支援' : '不支援（請用鍵盤上的麥克風輸入）';
+  app.innerHTML = `
+    ${topbar('設定與備份', '#')}
+    <section class="card">
+      <h2>備份</h2>
+      <p class="muted" style="margin:0">卡片只存在這支手機的瀏覽器裡。清除瀏覽器資料或換手機時會不見，請定期匯出備份檔，存到雲端硬碟或傳給自己。</p>
+      <span class="muted">上次備份：${esc(last)}・共 ${cards.length} 張</span>
+      <button class="btn" id="export">匯出備份檔</button>
+      <label class="btn ghost" style="cursor:pointer">匯入備份檔<input type="file" id="import" accept="application/json,.json" style="display:none"></label>
+    </section>
+    <section class="card">
+      <h2>這支手機的語音功能</h2>
+      <span class="muted">朗讀：${synth ? '支援' : '不支援'}</span>
+      <span class="muted">語音輸入：${voiceInfo}</span>
+      <button class="btn ghost" id="test">測試朗讀</button>
+    </section>
+    <section class="card">
+      <h2>加到主畫面</h2>
+      <p class="muted" style="margin:0">iPhone：用 Safari 打開，按分享 → 加入主畫面。Android：用 Chrome 打開，按右上角選單 → 加到主畫面。之後就能像 App 一樣打開。</p>
+    </section>
+  `;
+  const $ = (s) => app.querySelector(s);
+  $('#export').addEventListener('click', () => {
+    const data = JSON.stringify({ app: 'english-cards', version: 1, exported: Date.now(), cards }, null, 1);
+    const blob = new Blob([data], { type: 'application/json' });
+    const a = document.createElement('a');
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    a.href = URL.createObjectURL(blob);
+    a.download = `english-cards-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    settings.lastBackup = Date.now();
+    saveSettings();
+    toast('已匯出備份檔');
+    viewSettings();
+  });
+  $('#import').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      const incoming = Array.isArray(data) ? data : data.cards;
+      if (!Array.isArray(incoming)) throw new Error('format');
+      let added = 0;
+      let updated = 0;
+      incoming.forEach((c) => {
+        if (!c || !c.id || !c.en) return;
+        const cur = getCard(c.id);
+        if (!cur) { cards.push(Object.assign(blankCard(c.type), c)); added++; }
+        else if ((c.updated || 0) > (cur.updated || 0)) { Object.assign(cur, c); updated++; }
+      });
+      saveCards();
+      toast(`匯入完成：新增 ${added} 張，更新 ${updated} 張`);
+      viewSettings();
+    } catch (err) {
+      toast('這個檔案不是有效的備份檔');
+    }
+  });
+  $('#test').addEventListener('click', async () => {
+    await speak('你好，這是中文測試。', 'zh', 1);
+    await speak('Hello, this is an English test.', 'en', settings.enRate);
+  });
+}
+
+/* ========== 啟動 ========== */
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
+route();
