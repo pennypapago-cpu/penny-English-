@@ -121,7 +121,8 @@ input[type=text], input[type=search], textarea, select {
   width: 100%; min-width: 0; min-height: 50px; border: 1px solid var(--line); border-radius: 12px;
   padding: 12px 14px; background: var(--card); font-size: 16px; color: var(--ink);
 }
-textarea { resize: vertical; min-height: 84px; line-height: 1.5; }
+textarea { resize: none; overflow: hidden; min-height: 100px; line-height: 1.6; }
+textarea.tall { min-height: 160px; }
 input.big-en { font-weight: 700; font-size: 18px; }
 
 .progress { flex-grow: 1; height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }

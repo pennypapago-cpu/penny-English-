@@ -215,6 +215,18 @@ function sleep(ms, token) {
   });
 }
 
+// 文字框跟著內容自動變高，長段落也能一次看完
+function fitTextarea(t) {
+  t.style.height = 'auto';
+  t.style.height = t.scrollHeight + 2 + 'px';
+}
+function fitAllTextareas() {
+  app.querySelectorAll('textarea').forEach(fitTextarea);
+}
+document.addEventListener('input', (e) => {
+  if (e.target.tagName === 'TEXTAREA') fitTextarea(e.target);
+});
+
 const TYPE_LABEL = { word: '單字', phrase: '片語', sentence: '句子' };
 
 const ICON = {
@@ -396,7 +408,7 @@ function viewEdit(id, params) {
     </label>
 
     <label class="field">我的筆記
-      <textarea id="note" style="min-height:60px">${esc(card.note)}</textarea>
+      <textarea id="note" class="tall">${esc(card.note)}</textarea>
     </label>
 
     <label class="row" style="min-height:44px"><input type="checkbox" id="flagged" ${card.flagged ? 'checked' : ''} style="width:22px;height:22px">標記為「還不熟」</label>
@@ -407,6 +419,7 @@ function viewEdit(id, params) {
   `;
 
   const $ = (s) => app.querySelector(s);
+  fitAllTextareas();
   app.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => {
     card.type = b.dataset.type;
     app.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x === b));
@@ -516,7 +529,8 @@ function drawReview() {
         <div class="answer-en">${esc(card.en)}</div>
         ${!askZh && card.zh ? `<div>${esc(card.zh)}</div>` : ''}
         ${card.context ? `<div style="font-size:14px">原句：${esc(card.context)}</div>` : ''}
-        ${card.source || card.note ? `<div style="font-size:13px">${card.source ? '出處：' + esc(card.source) : ''}${card.source && card.note ? '・' : ''}${card.note ? '筆記：' + esc(card.note) : ''}</div>` : ''}
+        ${card.source ? `<div style="font-size:13px">出處：${esc(card.source)}</div>` : ''}
+        ${card.note ? `<div style="font-size:15px;line-height:1.6;white-space:pre-line;border-top:1px solid rgba(15,62,62,0.2);padding-top:8px">${esc(card.note)}</div>` : ''}
       </section>` : ''}
 
     <div class="spacer"></div>
@@ -650,7 +664,7 @@ function viewTranslate() {
   };
 
   $('#zh').addEventListener('input', (e) => { d.zh = e.target.value; });
-  micButton($('#mic'), 'zh', (t) => { d.zh = t; $('#zh').value = t; });
+  micButton($('#mic'), 'zh', (t) => { d.zh = t; $('#zh').value = t; fitTextarea($('#zh')); });
 
   $('#ask').addEventListener('click', async () => {
     const zh = $('#zh').value.trim();
@@ -689,6 +703,7 @@ function viewTranslate() {
   });
 
   drawOptions();
+  fitAllTextareas();
 }
 
 /* ========== 連續播放：一進來就自動播，播完從頭循環，不放按鈕 ========== */
