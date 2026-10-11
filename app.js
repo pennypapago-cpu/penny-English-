@@ -8,7 +8,6 @@ const DAY = 24 * 60 * 60 * 1000;
 const MIN = 60 * 1000;
 
 const DEFAULT_SETTINGS = {
-  listenSource: 'due', // due | all | flagged
   zhTimes: 1,
   enTimes: 3,
   gap: 2,
@@ -124,6 +123,8 @@ function pickVoice(lang) {
   return null;
 }
 
+let lastSpeechStart = 0;
+
 function speak(text, lang, rate) {
   return new Promise((resolve) => {
     if (!synth || !text) return resolve();
@@ -132,6 +133,7 @@ function speak(text, lang, rate) {
     const v = pickVoice(lang);
     if (v) u.voice = v;
     u.rate = rate || 1;
+    u.onstart = () => { lastSpeechStart = Date.now(); };
     u.onend = () => resolve();
     u.onerror = () => resolve();
     synth.speak(u);
@@ -296,7 +298,7 @@ function viewHome() {
       <span>今天要複習</span>
       <div class="row" style="align-items:baseline"><span class="count">${due}</span><span>張卡片${due ? '・約 ' + minutes + ' 分鐘' : ''}</span></div>
       <a class="btn" href="#review?restart=1">${due ? '開始複習' : '今天的複習完成了'}</a>
-      <a class="btn outline" href="#listen">${ICON.headphones}用聽的（連續播放）</a>
+      <a class="btn outline" href="#listen">${ICON.headphones}連續播放（自動開始）</a>
     </section>
 
     <div class="grid2">
@@ -689,11 +691,10 @@ function viewTranslate() {
   drawOptions();
 }
 
-/* ========== 連續播放 ========== */
+/* ========== 連續播放：一進來就自動播，播完從頭循環，不放按鈕 ========== */
 
-let player = null; // { list:[id], index, enDone, phase, playing, token }
+let player = null; // { list:[id], index, enDone, phase, token }
 let wakeLock = null;
-let listenSettingsOpen = false;
 
 async function lockScreenOn() {
   try {
@@ -704,162 +705,113 @@ function releaseScreen() {
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && player && player.playing) lockScreenOn();
+  if (document.visibilityState === 'visible' && player && player.token) lockScreenOn();
 });
 
-function buildPlaylist() {
-  let list;
-  if (settings.listenSource === 'flagged') list = cards.filter((c) => c.flagged);
-  else if (settings.listenSource === 'all') list = cards.slice().sort((a, b) => b.created - a.created);
-  else list = dueCards();
-  return list.map((c) => c.id);
+// iPhone 的瀏覽器只允許在「點擊當下」開始朗讀，所以在點進連續播放的那一下先解鎖
+function unlockSpeech() {
+  if (!synth) return;
+  const u = new SpeechSynthesisUtterance(' ');
+  u.volume = 0;
+  synth.speak(u);
 }
+document.addEventListener('click', (e) => {
+  if (e.target.closest && e.target.closest('a[href="#listen"]')) unlockSpeech();
+}, true);
 
 function viewListen() {
   document.body.classList.add('dark');
-  // 離開畫面時會暫停，所以每次進來都依最新卡片重建清單
-  player = { list: buildPlaylist(), index: 0, enDone: 0, phase: 'idle', playing: false, token: null };
-  leaveView = () => { pausePlayer(); releaseScreen(); };
+  const list = cards.slice().sort((a, b) => b.created - a.created).map((c) => c.id);
+  player = { list, index: 0, enDone: 0, phase: 'idle', token: null, needTap: false };
+  leaveView = () => { stopPlayer(); releaseScreen(); };
   drawListen();
+  if (list.length) runPlayer();
 }
 
 function drawListen() {
   const p = player;
   const card = getCard(p.list[p.index]);
-  const total = p.list.length;
-  const nextCard = getCard(p.list[p.index + 1]);
+  const nextCard = getCard(p.list[(p.index + 1) % p.list.length]);
   const dots = Array.from({ length: settings.enTimes }, (_, i) => `<span class="${i < p.enDone ? 'on' : ''}"></span>`).join('');
-  const opt = (v, cur, label) => `<option value="${v}" ${String(v) === String(cur) ? 'selected' : ''}>${label}</option>`;
 
   app.innerHTML = `
-    <div class="listen stack" style="gap:18px;flex-grow:1">
+    <div class="listen stack" id="listen" style="gap:18px;flex-grow:1">
       <div class="topbar">
         <a class="icon-btn plain" href="#" aria-label="返回首頁">${ICON.back}</a>
         <h1>連續播放</h1>
-        <span class="label" style="width:44px;text-align:right">${total ? (p.index + 1) + ' / ' + total : ''}</span>
+        <span class="label" style="width:44px;text-align:right">${p.list.length ? (p.index + 1) + ' / ' + p.list.length : ''}</span>
       </div>
-
-      <details id="listen-settings" ${total && !listenSettingsOpen ? '' : 'open'}>
-        <summary class="label" style="min-height:32px">播放設定：${{ due: '今日複習', all: '全部卡片', flagged: '不熟的卡片' }[settings.listenSource]}・中文 ${settings.zhTimes} 次・英文 ${settings.enTimes} 次・間隔 ${settings.gap} 秒</summary>
-        <div class="grid2" style="margin-top:10px">
-          <label class="field">播哪些卡片<select id="s-src">${opt('due', settings.listenSource, '今日複習')}${opt('all', settings.listenSource, '全部卡片')}${opt('flagged', settings.listenSource, '不熟的卡片')}</select></label>
-          <label class="field">英文速度<select id="s-rate">${opt(0.7, settings.enRate, '慢')}${opt(0.9, settings.enRate, '稍慢')}${opt(1, settings.enRate, '正常')}</select></label>
-          <label class="field">中文唸幾次<select id="s-zh">${[0, 1, 2].map((n) => opt(n, settings.zhTimes, n + ' 次')).join('')}</select></label>
-          <label class="field">英文唸幾次<select id="s-en">${[1, 2, 3, 4, 5].map((n) => opt(n, settings.enTimes, n + ' 次')).join('')}</select></label>
-          <label class="field">每句間隔<select id="s-gap">${[1, 2, 3, 5].map((n) => opt(n, settings.gap, n + ' 秒')).join('')}</select></label>
-        </div>
-      </details>
-
       ${card ? `
         <div class="stack" style="gap:24px;flex-grow:1;justify-content:center">
           <div class="stack"><span class="label">中文</span><div class="zh">${esc(card.zh || '（沒有中文）')}</div></div>
           <div class="stack" style="gap:10px">
-            <span class="label">英文${p.phase === 'en' ? '・正在播第 ' + Math.min(p.enDone + 1, settings.enTimes) + ' 次' : ''}</span>
+            <span class="label">英文${p.phase === 'en' ? '・第 ' + Math.min(p.enDone + 1, settings.enTimes) + ' 次' : ''}</span>
             <div class="en">${esc(card.en)}</div>
             <div class="dots">${dots}</div>
           </div>
-          <span class="label">${nextCard ? '下一張：' + esc(nextCard.en) : '這是最後一張'}</span>
+          ${p.list.length > 1 ? `<span class="label">下一張：${esc(nextCard.en)}</span>` : ''}
         </div>
-
-        <div class="row" style="justify-content:center;gap:28px">
-          <button class="icon-btn side" id="prev" aria-label="上一張">${ICON.prev}</button>
-          <button class="icon-btn play" id="toggle" aria-label="${p.playing ? '暫停' : '播放'}">${p.playing ? ICON.pause : ICON.play}</button>
-          <button class="icon-btn side" id="next" aria-label="下一張">${ICON.next}</button>
-        </div>
-        <button class="btn ghost ${card.flagged ? 'on' : ''}" id="flag">${card.flagged ? '已標記為不熟（再按取消）' : '這張還不熟，標記起來'}</button>
-      ` : `<div class="empty" style="color:#B9CCCF">這個清單裡沒有卡片。<br>換個「播哪些卡片」試試看。</div>`}
+        <p class="label" style="text-align:center;margin:0">${p.needTap ? '沒有聲音的話，點一下畫面開始' : '會一直循環播放，按左上角離開'}</p>
+      ` : `<div class="empty" style="color:#B9CCCF">還沒有卡片。<br>先到「新增卡片」記幾個單字吧。</div>`}
     </div>
   `;
 
-  const $ = (s) => app.querySelector(s);
-  const onSetting = (sel, key, num) => $(sel).addEventListener('change', (e) => {
-    settings[key] = num ? Number(e.target.value) : e.target.value;
-    saveSettings();
-    if (key === 'listenSource') {
-      pausePlayer();
-      player = { list: buildPlaylist(), index: 0, enDone: 0, phase: 'idle', playing: false, token: null };
-    }
-    drawListen();
-  });
-  $('#listen-settings').addEventListener('toggle', (e) => { listenSettingsOpen = e.target.open; });
-  onSetting('#s-src', 'listenSource');
-  onSetting('#s-rate', 'enRate', true);
-  onSetting('#s-zh', 'zhTimes', true);
-  onSetting('#s-en', 'enTimes', true);
-  onSetting('#s-gap', 'gap', true);
-
-  if (!card) return;
-  $('#toggle').addEventListener('click', () => { if (p.playing) { pausePlayer(); drawListen(); } else startPlayer(); });
-  $('#prev').addEventListener('click', () => jump(-1));
-  $('#next').addEventListener('click', () => jump(1));
-  $('#flag').addEventListener('click', () => {
-    const c = getCard(p.list[p.index]);
-    if (!c) return;
-    c.flagged = !c.flagged;
-    upsertCard(c);
-    drawListen();
+  // 備援：如果手機擋住了自動朗讀，點畫面任何地方就重新開始
+  const box = app.querySelector('#listen');
+  if (card) box.addEventListener('click', (e) => {
+    if (e.target.closest('a')) return;
+    if (!p.needTap) return;
+    unlockSpeech();
+    p.needTap = false;
+    runPlayer();
   });
 }
 
-function pausePlayer() {
+function stopPlayer() {
   if (!player) return;
   if (player.token) player.token.cancelled = true;
   player.token = null;
-  player.playing = false;
   player.phase = 'idle';
   stopSpeaking();
 }
 
-function jump(delta) {
-  const wasPlaying = player.playing;
-  pausePlayer();
-  player.index = Math.max(0, Math.min(player.list.length - 1, player.index + delta));
-  player.enDone = 0;
-  if (wasPlaying) startPlayer(); else drawListen();
-}
-
-async function startPlayer() {
+async function runPlayer() {
   const p = player;
-  if (!p.list.length) return;
-  pausePlayer();
+  stopPlayer();
   const token = { cancelled: false };
   p.token = token;
-  p.playing = true;
-  lockScreenOn();
-  // 從目前這張的開頭重新播
   p.enDone = 0;
+  lockScreenOn();
 
-  while (!token.cancelled && p.index < p.list.length) {
+  // 兩秒內都沒開始發聲，代表手機擋住了自動朗讀，顯示「點一下畫面」提示
+  const startedAt = Date.now();
+  setTimeout(() => {
+    if (!token.cancelled && lastSpeechStart < startedAt) { p.needTap = true; drawListen(); }
+  }, 2000);
+
+  while (!token.cancelled) {
+    if (!p.list.length) return;
     const card = getCard(p.list[p.index]);
-    if (!card) { p.index++; continue; }
-
-    p.phase = 'zh';
-    drawListen();
-    for (let i = 0; i < settings.zhTimes && card.zh && !token.cancelled; i++) {
-      await speak(card.zh, 'zh', 1);
-      await sleep(700, token);
-    }
-    p.phase = 'en';
-    for (let i = 0; i < settings.enTimes && !token.cancelled; i++) {
+    if (card) {
+      p.phase = 'zh';
+      p.enDone = 0;
       drawListen();
-      await speak(card.en, 'en', settings.enRate);
-      if (token.cancelled) break;
-      p.enDone = i + 1;
-      drawListen();
-      await sleep(i < settings.enTimes - 1 ? 900 : settings.gap * 1000, token);
+      for (let i = 0; i < settings.zhTimes && card.zh && !token.cancelled; i++) {
+        await speak(card.zh, 'zh', 1);
+        await sleep(700, token);
+      }
+      p.phase = 'en';
+      for (let i = 0; i < settings.enTimes && !token.cancelled; i++) {
+        drawListen();
+        await speak(card.en, 'en', settings.enRate);
+        if (token.cancelled) break;
+        p.enDone = i + 1;
+        drawListen();
+        await sleep(i < settings.enTimes - 1 ? 900 : settings.gap * 1000, token);
+      }
     }
     if (token.cancelled) return;
-    if (p.index >= p.list.length - 1) break;
-    p.index++;
-    p.enDone = 0;
-  }
-
-  if (!token.cancelled) {
-    p.playing = false;
-    p.phase = 'idle';
-    releaseScreen();
-    toast('播完了');
-    drawListen();
+    p.index = (p.index + 1) % p.list.length; // 播完最後一張就回到第一張
   }
 }
 
