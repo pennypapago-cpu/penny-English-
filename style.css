@@ -201,3 +201,7 @@ body.dark #app { color: #fff; }
 /* 例句清單 */
 .ex-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); }
 .ex-row .icon-btn { width: 40px; height: 40px; }
+
+/* 例句清單（編輯） */
+.ex-edit { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.ex-edit textarea { min-height: 56px; }

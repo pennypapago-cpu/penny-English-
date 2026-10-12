@@ -25,10 +25,18 @@ function loadJSON(key, fallback) {
 }
 
 let cards = loadJSON(CARDS_KEY, []);
-// 舊版的「看到的原句」搬到新的「例句（英文）」
-cards.forEach((c) => {
-  if (c.context && !c.exampleEn) c.exampleEn = c.context;
-});
+// 例句是一個清單 [{ en, zh }]；舊版的單一例句或「看到的原句」自動搬進來
+function normalizeCard(c) {
+  if (!Array.isArray(c.examples)) {
+    c.examples = [];
+    const en = c.exampleEn || c.context;
+    if (en) c.examples.push({ en, zh: c.exampleZh || '' });
+  }
+  delete c.exampleEn;
+  delete c.exampleZh;
+  return c;
+}
+cards.forEach(normalizeCard);
 let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(SETTINGS_KEY, {}));
 
 function saveCards() {
@@ -160,7 +168,7 @@ function blankCard(type) {
   const now = Date.now();
   return {
     id: newId(), type: type || 'word', en: '', zh: '', context: '', source: '', note: '',
-    created: now, updated: now, due: now, interval: 0, ease: 2.5, reps: 0, lapses: 0, flagged: false,
+    examples: [], created: now, updated: now, due: now, interval: 0, ease: 2.5, reps: 0, lapses: 0, flagged: false,
   };
 }
 
@@ -457,7 +465,7 @@ function viewCards() {
   const draw = () => {
     const k = q.value.trim().toLowerCase();
     const items = orderedCards()
-      .filter((c) => !k || [c.en, c.zh, c.source, c.note, c.exampleEn, c.exampleZh].join(' ').toLowerCase().includes(k));
+      .filter((c) => !k || [c.en, c.zh, c.source, c.note].concat((c.examples || []).map((x) => x.en + ' ' + x.zh)).join(' ').toLowerCase().includes(k));
     // 搜尋時只顯示部分卡片，不開放拖曳，避免順序亂掉
     app.querySelector('#sort-hint').hidden = !!k || items.length < 2;
     list.innerHTML = items.length
@@ -561,22 +569,10 @@ function viewEdit(id, params) {
       </div>
     </div>
 
-    <label class="field">例句（英文）
-      <span class="field-row">
-        <textarea id="ex-en" style="min-height:70px">${esc(card.exampleEn)}</textarea>
-        <span class="stack" style="gap:6px">
-          <button type="button" class="icon-btn" id="mic-ex-en" aria-label="用說的輸入英文例句">${ICON.mic}</button>
-          <button type="button" class="icon-btn" id="say-ex" aria-label="播放例句發音">${ICON.speaker}</button>
-        </span>
-      </span>
-    </label>
-
-    <label class="field">例句（中文）
-      <span class="field-row">
-        <textarea id="ex-zh" style="min-height:70px">${esc(card.exampleZh)}</textarea>
-        <button type="button" class="icon-btn" id="mic-ex-zh" aria-label="用說的輸入中文例句">${ICON.mic}</button>
-      </span>
-    </label>
+    <div class="field">例句
+      <div class="stack" id="ex-list"></div>
+      <button type="button" class="btn ghost" id="ex-add" style="min-height:46px;font-size:15px;width:100%">${ICON.plus}新增例句</button>
+    </div>
 
     <label class="field">我的筆記
       <textarea id="note" class="tall">${esc(card.note)}</textarea>
@@ -597,9 +593,50 @@ function viewEdit(id, params) {
   }));
   micButton($('#mic-en'), 'en', (t) => { $('#en').value = t; });
   micButton($('#mic-zh'), 'zh', (t) => { $('#zh').value = t; });
-  $('#say-ex').addEventListener('click', () => { stopSpeaking(); speak($('#ex-en').value.trim(), 'en', settings.enRate); });
-  micButton($('#mic-ex-en'), 'en', (t) => { $('#ex-en').value = t; fitTextarea($('#ex-en')); });
-  micButton($('#mic-ex-zh'), 'zh', (t) => { $('#ex-zh').value = t; fitTextarea($('#ex-zh')); });
+  // 例句清單：可以自由新增、刪除
+  const exs = (card.examples || []).map((x) => ({ en: x.en, zh: x.zh || '' }));
+  const drawExamples = (focusLast) => {
+    const box = $('#ex-list');
+    box.innerHTML = exs.length ? exs.map((x, i) => `
+      <div class="ex-edit" data-i="${i}">
+        <div class="row between"><span class="muted">例句 ${i + 1}</span>
+          <button type="button" class="btn danger ex-del" style="min-height:36px;font-size:13px;padding:0 12px">刪除</button></div>
+        <span class="field-row">
+          <textarea class="ex-en" placeholder="英文例句" aria-label="例句 ${i + 1} 英文" style="min-height:56px">${esc(x.en)}</textarea>
+          <span class="stack" style="gap:6px">
+            <button type="button" class="icon-btn ex-mic-en" aria-label="用說的輸入英文例句">${ICON.mic}</button>
+            <button type="button" class="icon-btn ex-say" aria-label="播放例句發音">${ICON.speaker}</button>
+          </span>
+        </span>
+        <span class="field-row">
+          <textarea class="ex-zh" placeholder="中文翻譯" aria-label="例句 ${i + 1} 中文" style="min-height:56px">${esc(x.zh)}</textarea>
+          <button type="button" class="icon-btn ex-mic-zh" aria-label="用說的輸入中文例句">${ICON.mic}</button>
+        </span>
+      </div>`).join('') : '<span class="muted">還沒有例句。按下面「新增例句」，或用上面的「找解釋和生活例句」。</span>';
+    box.querySelectorAll('.ex-edit').forEach((row) => {
+      const i = Number(row.dataset.i);
+      const en = row.querySelector('.ex-en');
+      const zh = row.querySelector('.ex-zh');
+      en.addEventListener('input', () => { exs[i].en = en.value; });
+      zh.addEventListener('input', () => { exs[i].zh = zh.value; });
+      row.querySelector('.ex-del').addEventListener('click', () => { exs.splice(i, 1); drawExamples(); });
+      row.querySelector('.ex-say').addEventListener('click', () => { stopSpeaking(); speak(en.value.trim(), 'en', settings.enRate); });
+      micButton(row.querySelector('.ex-mic-en'), 'en', (t) => { en.value = t; exs[i].en = t; fitTextarea(en); });
+      micButton(row.querySelector('.ex-mic-zh'), 'zh', (t) => { zh.value = t; exs[i].zh = t; fitTextarea(zh); });
+      fitTextarea(en);
+      fitTextarea(zh);
+    });
+    if (focusLast) { const last = box.querySelector('.ex-edit:last-child .ex-en'); if (last) last.focus(); }
+  };
+  $('#ex-add').addEventListener('click', () => { exs.push({ en: '', zh: '' }); drawExamples(true); });
+  drawExamples();
+  // 給「找解釋和生活例句」用：把選中的例句加進清單
+  addExampleToForm = (ex) => {
+    if (exs.some((x) => x.en.trim() === ex.en.trim())) { toast('這個例句已經在清單裡'); return; }
+    exs.push({ en: ex.en, zh: ex.zh || '' });
+    drawExamples();
+    toast('已加入例句');
+  };
   bindLookup($);
 
   // 圖片：undefined = 沒動、null = 移除、字串 = 新圖片
@@ -634,8 +671,7 @@ function viewEdit(id, params) {
   $('#save').addEventListener('click', () => {
     card.en = $('#en').value.trim();
     card.zh = $('#zh').value.trim();
-    card.exampleEn = $('#ex-en').value.trim();
-    card.exampleZh = $('#ex-zh').value.trim();
+    card.examples = exs.map((x) => ({ en: x.en.trim(), zh: x.zh.trim() })).filter((x) => x.en);
     card.note = $('#note').value.trim();
     card.flagged = $('#flagged').checked;
     if (!card.en) { toast('請先填英文'); return; }
@@ -745,18 +781,14 @@ function parseExamples(text) {
     .slice(0, 6);
 }
 
+let addExampleToForm = () => {};
+
 // 編輯畫面上的「找解釋和生活例句」
 function bindLookup($) {
   const box = $('#lookup-box');
   let examples = [];
 
-  const useExample = (ex) => {
-    $('#ex-en').value = ex.en;
-    $('#ex-zh').value = ex.zh || '';
-    fitTextarea($('#ex-en'));
-    fitTextarea($('#ex-zh'));
-    toast('已放進「例句」欄');
-  };
+  const useExample = (ex) => addExampleToForm(ex);
 
   const exampleList = (list, source) => list.map((ex, i) => `
     <div class="ex-row" data-i="${i}" data-src="${esc(source)}">
@@ -901,7 +933,7 @@ function drawReview() {
         </div>
         <div class="answer-en">${esc(card.en)}</div>
         ${!askZh && card.zh ? `<div>${esc(card.zh)}</div>` : ''}
-        ${card.exampleEn ? `<div class="row" style="align-items:flex-start;gap:10px;border-top:1px solid rgba(15,62,62,0.2);padding-top:8px"><div style="flex:1"><div style="font-size:16px;font-weight:500;white-space:pre-line">${esc(card.exampleEn)}</div>${card.exampleZh ? `<div style="font-size:14px;white-space:pre-line">${esc(card.exampleZh)}</div>` : ''}</div><button class="icon-btn" id="play-ctx" aria-label="播放例句" style="width:40px;height:40px">${ICON.speaker}</button></div>` : ''}
+        ${(card.examples || []).map((x, i) => `<div class="row" style="align-items:flex-start;gap:10px;border-top:1px solid rgba(15,62,62,0.2);padding-top:8px"><div style="flex:1"><div style="font-size:16px;font-weight:500;white-space:pre-line">${esc(x.en)}</div>${x.zh ? `<div style="font-size:14px;white-space:pre-line">${esc(x.zh)}</div>` : ''}</div><button class="icon-btn play-ex" data-i="${i}" aria-label="播放例句 ${i + 1}" style="width:40px;height:40px">${ICON.speaker}</button></div>`).join('')}
         ${card.note ? `<div style="font-size:15px;line-height:1.6;white-space:pre-line;border-top:1px solid rgba(15,62,62,0.2);padding-top:8px">${esc(card.note)}</div>` : ''}
       </section>` : ''}
 
@@ -929,7 +961,7 @@ function drawReview() {
   });
   if ($('#play')) $('#play').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', settings.enRate); });
   if ($('#slow')) $('#slow').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', 0.6); });
-  if ($('#play-ctx')) $('#play-ctx').addEventListener('click', () => { stopSpeaking(); speak(card.exampleEn, 'en', settings.enRate); });
+  app.querySelectorAll('.play-ex').forEach((b) => b.addEventListener('click', () => { stopSpeaking(); speak(card.examples[Number(b.dataset.i)].en, 'en', settings.enRate); }));
   if ($('#speak')) micButton($('#speak'), 'en', (t) => {
     const firstTry = !review.revealed;
     review.said = t;
@@ -1139,10 +1171,12 @@ function drawListen() {
             <div class="en">${esc(card.en)}</div>
             <div class="dots">${dots}</div>
           </div>
-          ${card.exampleEn ? `<div class="stack" style="gap:6px">
-            <span class="label">例句${p.phase === 'ex' ? '・播放中' : ''}</span>
-            <div style="font-size:19px;line-height:1.45;${p.phase === 'ex' ? 'color:#fff;font-weight:700' : 'color:#D9E6E7'}">${esc(card.exampleEn)}</div>
-            ${card.exampleZh ? `<div style="font-size:15px;color:#B9CCCF">${esc(card.exampleZh)}</div>` : ''}
+          ${(card.examples || []).length ? `<div class="stack" style="gap:10px">
+            <span class="label">例句</span>
+            ${card.examples.map((x, i) => { const on = p.phase === 'ex' && p.exIndex === i; return `<div class="stack" style="gap:2px">
+              <div style="font-size:18px;line-height:1.45;${on ? 'color:#fff;font-weight:700' : 'color:#D9E6E7'}">${esc(x.en)}</div>
+              ${x.zh ? `<div style="font-size:14px;color:#B9CCCF">${esc(x.zh)}</div>` : ''}
+            </div>`; }).join('')}
           </div>` : ''}
           ${p.list.length > 1 ? `<span class="label">下一張：${esc(nextCard.en)}</span>` : ''}
         </div>
@@ -1204,16 +1238,19 @@ async function runPlayer() {
         p.enDone = i + 1;
         drawListen();
         const last = i === settings.enTimes - 1;
-        await sleep(!last ? 900 : card.exampleEn ? 1000 : settings.gap * 1000, token);
+        const hasEx = (card.examples || []).length > 0;
+        await sleep(!last ? 900 : hasEx ? 1000 : settings.gap * 1000, token);
       }
-      // 例句：中文 1 次、英文 2 次
-      if (card.exampleEn && !token.cancelled) {
+      // 每個例句：中文 1 次、英文 2 次
+      const exList = card.examples || [];
+      for (let e = 0; e < exList.length && !token.cancelled; e++) {
         p.phase = 'ex';
+        p.exIndex = e;
         drawListen();
-        if (card.exampleZh) { await speak(card.exampleZh, 'zh', 1); await sleep(700, token); }
+        if (exList[e].zh) { await speak(exList[e].zh, 'zh', 1); await sleep(700, token); }
         for (let i = 0; i < 2 && !token.cancelled; i++) {
-          await speak(card.exampleEn, 'en', settings.enRate);
-          await sleep(i === 0 ? 1000 : settings.gap * 1000, token);
+          await speak(exList[e].en, 'en', settings.enRate);
+          await sleep(i === 0 || e < exList.length - 1 ? 1000 : settings.gap * 1000, token);
         }
       }
     }
@@ -1278,6 +1315,7 @@ function viewSettings() {
       incoming.forEach((c) => {
         if (!c || !c.id || !c.en) return;
         const cur = getCard(c.id);
+        normalizeCard(c);
         if (!cur) { cards.push(Object.assign(blankCard(c.type), c)); added++; }
         else if ((c.updated || 0) > (cur.updated || 0)) { Object.assign(cur, c); updated++; }
       });
