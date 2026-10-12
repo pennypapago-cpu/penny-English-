@@ -25,6 +25,10 @@ function loadJSON(key, fallback) {
 }
 
 let cards = loadJSON(CARDS_KEY, []);
+// 舊版的「看到的原句」搬到新的「例句（英文）」
+cards.forEach((c) => {
+  if (c.context && !c.exampleEn) c.exampleEn = c.context;
+});
 let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(SETTINGS_KEY, {}));
 
 function saveCards() {
@@ -410,7 +414,7 @@ function viewHome() {
     </section>
 
     <div class="grid2">
-      <a class="tile" href="#add">${ICON.plus}<strong>新增卡片</strong><span class="muted">單字、句子、出處</span></a>
+      <a class="tile" href="#add">${ICON.plus}<strong>新增卡片</strong><span class="muted">單字、例句、圖片</span></a>
       <a class="tile" href="#translate">${ICON.mic}<strong>中文怎麼說</strong><span class="muted">講中文，學英文說法</span></a>
     </div>
 
@@ -444,7 +448,7 @@ function bindListItems() {
 function viewCards() {
   app.innerHTML = `
     ${topbar('全部卡片', '#')}
-    <input type="search" id="q" placeholder="搜尋英文、中文或出處" aria-label="搜尋">
+    <input type="search" id="q" placeholder="搜尋英文、中文或例句" aria-label="搜尋">
     <p class="muted" id="sort-hint" style="margin:0">按住右邊的 ≡ 上下拖曳，可以調整順序（連續播放也照這個順序）</p>
     <div class="stack" id="list"></div>
   `;
@@ -453,7 +457,7 @@ function viewCards() {
   const draw = () => {
     const k = q.value.trim().toLowerCase();
     const items = orderedCards()
-      .filter((c) => !k || [c.en, c.zh, c.source, c.note, c.context].join(' ').toLowerCase().includes(k));
+      .filter((c) => !k || [c.en, c.zh, c.source, c.note, c.exampleEn, c.exampleZh].join(' ').toLowerCase().includes(k));
     // 搜尋時只顯示部分卡片，不開放拖曳，避免順序亂掉
     app.querySelector('#sort-hint').hidden = !!k || items.length < 2;
     list.innerHTML = items.length
@@ -557,15 +561,21 @@ function viewEdit(id, params) {
       </div>
     </div>
 
-    <label class="field">例句／看到的原句
+    <label class="field">例句（英文）
       <span class="field-row">
-        <textarea id="context">${esc(card.context)}</textarea>
-        <button type="button" class="icon-btn" id="say-ctx" aria-label="播放例句發音">${ICON.speaker}</button>
+        <textarea id="ex-en" style="min-height:70px">${esc(card.exampleEn)}</textarea>
+        <span class="stack" style="gap:6px">
+          <button type="button" class="icon-btn" id="mic-ex-en" aria-label="用說的輸入英文例句">${ICON.mic}</button>
+          <button type="button" class="icon-btn" id="say-ex" aria-label="播放例句發音">${ICON.speaker}</button>
+        </span>
       </span>
     </label>
 
-    <label class="field">出處
-      <input type="text" id="source" placeholder="網站、影片、書名或網址" value="${esc(card.source)}">
+    <label class="field">例句（中文）
+      <span class="field-row">
+        <textarea id="ex-zh" style="min-height:70px">${esc(card.exampleZh)}</textarea>
+        <button type="button" class="icon-btn" id="mic-ex-zh" aria-label="用說的輸入中文例句">${ICON.mic}</button>
+      </span>
     </label>
 
     <label class="field">我的筆記
@@ -587,7 +597,9 @@ function viewEdit(id, params) {
   }));
   micButton($('#mic-en'), 'en', (t) => { $('#en').value = t; });
   micButton($('#mic-zh'), 'zh', (t) => { $('#zh').value = t; });
-  $('#say-ctx').addEventListener('click', () => { stopSpeaking(); speak($('#context').value.trim(), 'en', settings.enRate); });
+  $('#say-ex').addEventListener('click', () => { stopSpeaking(); speak($('#ex-en').value.trim(), 'en', settings.enRate); });
+  micButton($('#mic-ex-en'), 'en', (t) => { $('#ex-en').value = t; fitTextarea($('#ex-en')); });
+  micButton($('#mic-ex-zh'), 'zh', (t) => { $('#ex-zh').value = t; fitTextarea($('#ex-zh')); });
   bindLookup($);
 
   // 圖片：undefined = 沒動、null = 移除、字串 = 新圖片
@@ -622,8 +634,8 @@ function viewEdit(id, params) {
   $('#save').addEventListener('click', () => {
     card.en = $('#en').value.trim();
     card.zh = $('#zh').value.trim();
-    card.context = $('#context').value.trim();
-    card.source = $('#source').value.trim();
+    card.exampleEn = $('#ex-en').value.trim();
+    card.exampleZh = $('#ex-zh').value.trim();
     card.note = $('#note').value.trim();
     card.flagged = $('#flagged').checked;
     if (!card.en) { toast('請先填英文'); return; }
@@ -692,17 +704,11 @@ function bindLookup($) {
   const box = $('#lookup-box');
   let examples = [];
 
-  const useExample = (ex, source) => {
-    $('#context').value = ex.en;
-    fitTextarea($('#context'));
-    if (ex.zh) {
-      const note = $('#note');
-      const line = '例句翻譯：' + ex.zh;
-      if (!note.value.includes(line)) note.value = note.value ? line + '\n\n' + note.value : line;
-      fitTextarea(note);
-    }
-    const src = $('#source').value.trim();
-    if (!src || src === 'Free Dictionary' || src === 'Claude 生活例句') $('#source').value = source;
+  const useExample = (ex) => {
+    $('#ex-en').value = ex.en;
+    $('#ex-zh').value = ex.zh || '';
+    fitTextarea($('#ex-en'));
+    fitTextarea($('#ex-zh'));
     toast('已放進「例句」欄');
   };
 
@@ -849,8 +855,7 @@ function drawReview() {
         </div>
         <div class="answer-en">${esc(card.en)}</div>
         ${!askZh && card.zh ? `<div>${esc(card.zh)}</div>` : ''}
-        ${card.context ? `<div class="row" style="align-items:flex-start;gap:10px"><div style="font-size:15px;flex:1;white-space:pre-line">例句：${esc(card.context)}</div><button class="icon-btn" id="play-ctx" aria-label="播放例句" style="width:40px;height:40px">${ICON.speaker}</button></div>` : ''}
-        ${card.source ? `<div style="font-size:13px">出處：${esc(card.source)}</div>` : ''}
+        ${card.exampleEn ? `<div class="row" style="align-items:flex-start;gap:10px;border-top:1px solid rgba(15,62,62,0.2);padding-top:8px"><div style="flex:1"><div style="font-size:16px;font-weight:500;white-space:pre-line">${esc(card.exampleEn)}</div>${card.exampleZh ? `<div style="font-size:14px;white-space:pre-line">${esc(card.exampleZh)}</div>` : ''}</div><button class="icon-btn" id="play-ctx" aria-label="播放例句" style="width:40px;height:40px">${ICON.speaker}</button></div>` : ''}
         ${card.note ? `<div style="font-size:15px;line-height:1.6;white-space:pre-line;border-top:1px solid rgba(15,62,62,0.2);padding-top:8px">${esc(card.note)}</div>` : ''}
       </section>` : ''}
 
@@ -878,7 +883,7 @@ function drawReview() {
   });
   if ($('#play')) $('#play').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', settings.enRate); });
   if ($('#slow')) $('#slow').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', 0.6); });
-  if ($('#play-ctx')) $('#play-ctx').addEventListener('click', () => { stopSpeaking(); speak(card.context, 'en', settings.enRate); });
+  if ($('#play-ctx')) $('#play-ctx').addEventListener('click', () => { stopSpeaking(); speak(card.exampleEn, 'en', settings.enRate); });
   if ($('#speak')) micButton($('#speak'), 'en', (t) => {
     const firstTry = !review.revealed;
     review.said = t;
@@ -1088,6 +1093,11 @@ function drawListen() {
             <div class="en">${esc(card.en)}</div>
             <div class="dots">${dots}</div>
           </div>
+          ${card.exampleEn ? `<div class="stack" style="gap:6px">
+            <span class="label">例句${p.phase === 'ex' ? '・播放中' : ''}</span>
+            <div style="font-size:19px;line-height:1.45;${p.phase === 'ex' ? 'color:#fff;font-weight:700' : 'color:#D9E6E7'}">${esc(card.exampleEn)}</div>
+            ${card.exampleZh ? `<div style="font-size:15px;color:#B9CCCF">${esc(card.exampleZh)}</div>` : ''}
+          </div>` : ''}
           ${p.list.length > 1 ? `<span class="label">下一張：${esc(nextCard.en)}</span>` : ''}
         </div>
         <p class="label" style="text-align:center;margin:0">${p.needTap ? '沒有聲音的話，點一下畫面開始' : '會一直循環播放，按左上角離開'}</p>
@@ -1147,7 +1157,18 @@ async function runPlayer() {
         if (token.cancelled) break;
         p.enDone = i + 1;
         drawListen();
-        await sleep(i < settings.enTimes - 1 ? 900 : settings.gap * 1000, token);
+        const last = i === settings.enTimes - 1;
+        await sleep(!last ? 900 : card.exampleEn ? 1000 : settings.gap * 1000, token);
+      }
+      // 例句：中文 1 次、英文 2 次
+      if (card.exampleEn && !token.cancelled) {
+        p.phase = 'ex';
+        drawListen();
+        if (card.exampleZh) { await speak(card.exampleZh, 'zh', 1); await sleep(700, token); }
+        for (let i = 0; i < 2 && !token.cancelled; i++) {
+          await speak(card.exampleEn, 'en', settings.enRate);
+          await sleep(i === 0 ? 1000 : settings.gap * 1000, token);
+        }
       }
     }
     if (token.cancelled) return;
