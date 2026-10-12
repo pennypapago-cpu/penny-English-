@@ -25,6 +25,10 @@ function loadJSON(key, fallback) {
 }
 
 let cards = loadJSON(CARDS_KEY, []);
+// 舊版的「看到的原句」搬到新的「例句（英文）」
+cards.forEach((c) => {
+  if (c.context && !c.exampleEn) c.exampleEn = c.context;
+});
 let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(SETTINGS_KEY, {}));
 
 function saveCards() {
@@ -338,6 +342,7 @@ const ICON = {
   pause: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>',
   prev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 5v14M19 5L9 12l10 7V5z"/></svg>',
   grip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 8h14M5 12h14M5 16h14"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>',
   next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 5v14M5 5l10 7-10 7V5z"/></svg>',
 };
 
@@ -409,7 +414,7 @@ function viewHome() {
     </section>
 
     <div class="grid2">
-      <a class="tile" href="#add">${ICON.plus}<strong>新增卡片</strong><span class="muted">單字、句子、出處</span></a>
+      <a class="tile" href="#add">${ICON.plus}<strong>新增卡片</strong><span class="muted">單字、例句、圖片</span></a>
       <a class="tile" href="#translate">${ICON.mic}<strong>中文怎麼說</strong><span class="muted">講中文，學英文說法</span></a>
     </div>
 
@@ -443,7 +448,7 @@ function bindListItems() {
 function viewCards() {
   app.innerHTML = `
     ${topbar('全部卡片', '#')}
-    <input type="search" id="q" placeholder="搜尋英文、中文或出處" aria-label="搜尋">
+    <input type="search" id="q" placeholder="搜尋英文、中文或例句" aria-label="搜尋">
     <p class="muted" id="sort-hint" style="margin:0">按住右邊的 ≡ 上下拖曳，可以調整順序（連續播放也照這個順序）</p>
     <div class="stack" id="list"></div>
   `;
@@ -452,7 +457,7 @@ function viewCards() {
   const draw = () => {
     const k = q.value.trim().toLowerCase();
     const items = orderedCards()
-      .filter((c) => !k || [c.en, c.zh, c.source, c.note, c.context].join(' ').toLowerCase().includes(k));
+      .filter((c) => !k || [c.en, c.zh, c.source, c.note, c.exampleEn, c.exampleZh].join(' ').toLowerCase().includes(k));
     // 搜尋時只顯示部分卡片，不開放拖曳，避免順序亂掉
     app.querySelector('#sort-hint').hidden = !!k || items.length < 2;
     list.innerHTML = items.length
@@ -535,6 +540,8 @@ function viewEdit(id, params) {
         <button type="button" class="icon-btn" id="say-en" aria-label="播放英文發音">${ICON.speaker}</button>
       </span>
     </label>
+    <button type="button" class="btn secondary" id="lookup" style="min-height:46px;font-size:15px">${ICON.search}找解釋和生活例句</button>
+    <div id="lookup-box" class="stack" hidden></div>
 
     <label class="field">中文意思
       <span class="field-row">
@@ -554,12 +561,21 @@ function viewEdit(id, params) {
       </div>
     </div>
 
-    <label class="field">看到的原句（上下文）
-      <textarea id="context">${esc(card.context)}</textarea>
+    <label class="field">例句（英文）
+      <span class="field-row">
+        <textarea id="ex-en" style="min-height:70px">${esc(card.exampleEn)}</textarea>
+        <span class="stack" style="gap:6px">
+          <button type="button" class="icon-btn" id="mic-ex-en" aria-label="用說的輸入英文例句">${ICON.mic}</button>
+          <button type="button" class="icon-btn" id="say-ex" aria-label="播放例句發音">${ICON.speaker}</button>
+        </span>
+      </span>
     </label>
 
-    <label class="field">出處
-      <input type="text" id="source" placeholder="網站、影片、書名或網址" value="${esc(card.source)}">
+    <label class="field">例句（中文）
+      <span class="field-row">
+        <textarea id="ex-zh" style="min-height:70px">${esc(card.exampleZh)}</textarea>
+        <button type="button" class="icon-btn" id="mic-ex-zh" aria-label="用說的輸入中文例句">${ICON.mic}</button>
+      </span>
     </label>
 
     <label class="field">我的筆記
@@ -581,6 +597,10 @@ function viewEdit(id, params) {
   }));
   micButton($('#mic-en'), 'en', (t) => { $('#en').value = t; });
   micButton($('#mic-zh'), 'zh', (t) => { $('#zh').value = t; });
+  $('#say-ex').addEventListener('click', () => { stopSpeaking(); speak($('#ex-en').value.trim(), 'en', settings.enRate); });
+  micButton($('#mic-ex-en'), 'en', (t) => { $('#ex-en').value = t; fitTextarea($('#ex-en')); });
+  micButton($('#mic-ex-zh'), 'zh', (t) => { $('#ex-zh').value = t; fitTextarea($('#ex-zh')); });
+  bindLookup($);
 
   // 圖片：undefined = 沒動、null = 移除、字串 = 新圖片
   let newImage;
@@ -614,8 +634,8 @@ function viewEdit(id, params) {
   $('#save').addEventListener('click', () => {
     card.en = $('#en').value.trim();
     card.zh = $('#zh').value.trim();
-    card.context = $('#context').value.trim();
-    card.source = $('#source').value.trim();
+    card.exampleEn = $('#ex-en').value.trim();
+    card.exampleZh = $('#ex-zh').value.trim();
     card.note = $('#note').value.trim();
     card.flagged = $('#flagged').checked;
     if (!card.en) { toast('請先填英文'); return; }
@@ -636,6 +656,127 @@ function viewEdit(id, params) {
       go(back);
     });
   }
+}
+
+/* ========== 找解釋和例句 ========== */
+
+// 免費線上字典（Free Dictionary API，不用帳號）；有些字查不到例句
+async function lookupWord(word) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word), { signal: ctrl.signal });
+    if (res.status === 404) return { found: false, defs: [], examples: [] };
+    if (!res.ok) throw new Error('http ' + res.status);
+    const data = await res.json();
+    const out = { found: true, phonetic: '', defs: [], examples: [] };
+    (Array.isArray(data) ? data : []).forEach((entry) => {
+      if (!out.phonetic) out.phonetic = entry.phonetic || (entry.phonetics || []).map((x) => x.text).find(Boolean) || '';
+      (entry.meanings || []).forEach((m) => (m.definitions || []).forEach((d) => {
+        if (out.defs.length < 4 && d.definition) out.defs.push({ pos: m.partOfSpeech || '', text: d.definition });
+        if (d.example && out.examples.length < 6 && !out.examples.some((e) => e.en === d.example)) out.examples.push({ en: d.example, zh: '' });
+      }));
+    });
+    return out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildExamplePrompt(word) {
+  return `請給我 3 個使用「${word}」的日常生活英文例句，要簡短自然、真的會在生活中聽到的說法。
+每句一行，格式：英文例句｜繁體中文翻譯
+不要加編號、符號或其他說明。`;
+}
+
+function parseExamples(text) {
+  return text.split(/\n+/).map((line) => line.replace(/[*_#>`]/g, '').replace(/^\s*\d+[.)、]\s*/, '').trim())
+    .map((line) => {
+      const parts = line.split(/\s*[｜|]\s*/);
+      return parts.length >= 2 && /[a-z]/i.test(parts[0]) ? { en: parts[0].trim(), zh: parts.slice(1).join(' ').trim() } : null;
+    })
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+// 編輯畫面上的「找解釋和生活例句」
+function bindLookup($) {
+  const box = $('#lookup-box');
+  let examples = [];
+
+  const useExample = (ex) => {
+    $('#ex-en').value = ex.en;
+    $('#ex-zh').value = ex.zh || '';
+    fitTextarea($('#ex-en'));
+    fitTextarea($('#ex-zh'));
+    toast('已放進「例句」欄');
+  };
+
+  const exampleList = (list, source) => list.map((ex, i) => `
+    <div class="ex-row" data-i="${i}" data-src="${esc(source)}">
+      <div style="flex:1;min-width:0"><div style="font-size:16px">${esc(ex.en)}</div>${ex.zh ? `<div class="muted">${esc(ex.zh)}</div>` : ''}</div>
+      <button type="button" class="icon-btn ex-say" aria-label="播放這個例句">${ICON.speaker}</button>
+      <button type="button" class="btn ghost ex-use" style="min-height:44px;font-size:14px;padding:0 12px">用這句</button>
+    </div>`).join('');
+
+  const bindRows = (root, list) => {
+    root.querySelectorAll('.ex-row').forEach((row) => {
+      const ex = list[Number(row.dataset.i)];
+      row.querySelector('.ex-say').addEventListener('click', () => { stopSpeaking(); speak(ex.en, 'en', settings.enRate); });
+      row.querySelector('.ex-use').addEventListener('click', () => useExample(ex, row.dataset.src));
+    });
+  };
+
+  const claudePart = (word) => `
+    <div class="stack" style="border-top:1px solid var(--line);padding-top:12px">
+      <span class="muted">想要更生活化的例句？請 Claude 寫幾句，再把回答整段貼回來：</span>
+      <button type="button" class="btn ghost" id="ask-ex" style="min-height:44px;font-size:15px">${ICON.copy}複製問題並打開 Claude</button>
+      <textarea id="ex-paste" placeholder="長按這裡 → 貼上 Claude 的回答" aria-label="貼上 Claude 給的例句" style="min-height:70px"></textarea>
+      <div class="stack" id="ex-claude"></div>
+    </div>`;
+
+  const bindClaude = (word) => {
+    $('#ask-ex').addEventListener('click', async () => {
+      const prompt = buildExamplePrompt(word);
+      const copying = copyText(prompt);
+      window.open('https://claude.ai/new?q=' + encodeURIComponent(prompt), '_blank');
+      toast((await copying) ? '已複製，如果 Claude 沒有自動帶入，貼上後送出' : '複製失敗，請手動複製');
+    });
+    $('#ex-paste').addEventListener('input', (e) => {
+      examples = parseExamples(e.target.value);
+      const out = $('#ex-claude');
+      out.innerHTML = e.target.value.trim() && !examples.length
+        ? '<span class="muted">看不懂這段格式，可以直接把例句貼到下面的「例句」欄。</span>'
+        : exampleList(examples, 'Claude 生活例句');
+      bindRows(out, examples);
+    });
+  };
+
+  $('#lookup').addEventListener('click', async () => {
+    const word = $('#en').value.trim();
+    if (!word) { toast('請先輸入英文'); return; }
+    box.hidden = false;
+    box.className = 'card stack';
+    box.innerHTML = '<span class="muted">查詢中…</span>';
+    let result = null;
+    let failed = false;
+    try { result = await lookupWord(word); } catch (e) { failed = true; }
+
+    let html = '';
+    if (failed) html += '<span class="muted">連不上線上字典（可能沒有網路）。可以改用下面的 Claude。</span>';
+    else if (!result.found) html += `<span class="muted">字典裡查不到「${esc(word)}」。片語或句子可以改用下面的 Claude。</span>`;
+    else {
+      html += `<div class="row" style="gap:10px"><strong style="font-size:18px">${esc(word)}</strong>${result.phonetic ? `<span class="muted">${esc(result.phonetic)}</span>` : ''}</div>`;
+      html += result.defs.map((d) => `<div style="font-size:14px"><span class="tag grey">${esc(d.pos)}</span> ${esc(d.text)}</div>`).join('');
+      html += result.examples.length
+        ? '<span class="muted" style="margin-top:6px">字典例句</span>' + exampleList(result.examples, 'Free Dictionary')
+        : '<span class="muted">字典沒有這個字的例句。</span>';
+    }
+    html += claudePart(word);
+    box.innerHTML = html;
+    if (result && result.examples.length) bindRows(box, result.examples);
+    bindClaude(word);
+  });
 }
 
 /* ========== 每日複習 ========== */
@@ -714,8 +855,7 @@ function drawReview() {
         </div>
         <div class="answer-en">${esc(card.en)}</div>
         ${!askZh && card.zh ? `<div>${esc(card.zh)}</div>` : ''}
-        ${card.context ? `<div style="font-size:14px">原句：${esc(card.context)}</div>` : ''}
-        ${card.source ? `<div style="font-size:13px">出處：${esc(card.source)}</div>` : ''}
+        ${card.exampleEn ? `<div class="row" style="align-items:flex-start;gap:10px;border-top:1px solid rgba(15,62,62,0.2);padding-top:8px"><div style="flex:1"><div style="font-size:16px;font-weight:500;white-space:pre-line">${esc(card.exampleEn)}</div>${card.exampleZh ? `<div style="font-size:14px;white-space:pre-line">${esc(card.exampleZh)}</div>` : ''}</div><button class="icon-btn" id="play-ctx" aria-label="播放例句" style="width:40px;height:40px">${ICON.speaker}</button></div>` : ''}
         ${card.note ? `<div style="font-size:15px;line-height:1.6;white-space:pre-line;border-top:1px solid rgba(15,62,62,0.2);padding-top:8px">${esc(card.note)}</div>` : ''}
       </section>` : ''}
 
@@ -743,6 +883,7 @@ function drawReview() {
   });
   if ($('#play')) $('#play').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', settings.enRate); });
   if ($('#slow')) $('#slow').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', 0.6); });
+  if ($('#play-ctx')) $('#play-ctx').addEventListener('click', () => { stopSpeaking(); speak(card.exampleEn, 'en', settings.enRate); });
   if ($('#speak')) micButton($('#speak'), 'en', (t) => {
     const firstTry = !review.revealed;
     review.said = t;
@@ -952,6 +1093,11 @@ function drawListen() {
             <div class="en">${esc(card.en)}</div>
             <div class="dots">${dots}</div>
           </div>
+          ${card.exampleEn ? `<div class="stack" style="gap:6px">
+            <span class="label">例句${p.phase === 'ex' ? '・播放中' : ''}</span>
+            <div style="font-size:19px;line-height:1.45;${p.phase === 'ex' ? 'color:#fff;font-weight:700' : 'color:#D9E6E7'}">${esc(card.exampleEn)}</div>
+            ${card.exampleZh ? `<div style="font-size:15px;color:#B9CCCF">${esc(card.exampleZh)}</div>` : ''}
+          </div>` : ''}
           ${p.list.length > 1 ? `<span class="label">下一張：${esc(nextCard.en)}</span>` : ''}
         </div>
         <p class="label" style="text-align:center;margin:0">${p.needTap ? '沒有聲音的話，點一下畫面開始' : '會一直循環播放，按左上角離開'}</p>
@@ -1011,7 +1157,18 @@ async function runPlayer() {
         if (token.cancelled) break;
         p.enDone = i + 1;
         drawListen();
-        await sleep(i < settings.enTimes - 1 ? 900 : settings.gap * 1000, token);
+        const last = i === settings.enTimes - 1;
+        await sleep(!last ? 900 : card.exampleEn ? 1000 : settings.gap * 1000, token);
+      }
+      // 例句：中文 1 次、英文 2 次
+      if (card.exampleEn && !token.cancelled) {
+        p.phase = 'ex';
+        drawListen();
+        if (card.exampleZh) { await speak(card.exampleZh, 'zh', 1); await sleep(700, token); }
+        for (let i = 0; i < 2 && !token.cancelled; i++) {
+          await speak(card.exampleEn, 'en', settings.enRate);
+          await sleep(i === 0 ? 1000 : settings.gap * 1000, token);
+        }
       }
     }
     if (token.cancelled) return;
