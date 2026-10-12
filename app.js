@@ -46,6 +46,14 @@ function getCard(id) {
   return cards.find((c) => c.id === id);
 }
 
+// 卡片順序：手動排過的照 order，沒排過的（新卡）用建立時間排在最上面
+function sortKey(c) {
+  return typeof c.order === 'number' ? c.order : -c.created;
+}
+function orderedCards() {
+  return cards.slice().sort((a, b) => sortKey(a) - sortKey(b));
+}
+
 function upsertCard(card) {
   card.updated = Date.now();
   const i = cards.findIndex((c) => c.id === card.id);
@@ -329,6 +337,7 @@ const ICON = {
   play: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>',
   pause: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>',
   prev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 5v14M19 5L9 12l10 7V5z"/></svg>',
+  grip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 8h14M5 12h14M5 16h14"/></svg>',
   next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 5v14M5 5l10 7-10 7V5z"/></svg>',
 };
 
@@ -435,20 +444,69 @@ function viewCards() {
   app.innerHTML = `
     ${topbar('全部卡片', '#')}
     <input type="search" id="q" placeholder="搜尋英文、中文或出處" aria-label="搜尋">
+    <p class="muted" id="sort-hint" style="margin:0">按住右邊的 ≡ 上下拖曳，可以調整順序（連續播放也照這個順序）</p>
     <div class="stack" id="list"></div>
   `;
   const q = app.querySelector('#q');
   const list = app.querySelector('#list');
   const draw = () => {
     const k = q.value.trim().toLowerCase();
-    const items = cards
-      .filter((c) => !k || [c.en, c.zh, c.source, c.note, c.context].join(' ').toLowerCase().includes(k))
-      .sort((a, b) => b.created - a.created);
-    list.innerHTML = items.length ? items.map(listItem).join('') : '<div class="empty">找不到卡片</div>';
+    const items = orderedCards()
+      .filter((c) => !k || [c.en, c.zh, c.source, c.note, c.context].join(' ').toLowerCase().includes(k));
+    // 搜尋時只顯示部分卡片，不開放拖曳，避免順序亂掉
+    app.querySelector('#sort-hint').hidden = !!k || items.length < 2;
+    list.innerHTML = items.length
+      ? items.map((c) => `<div class="sort-row" data-id="${esc(c.id)}">${listItem(c)}${k ? '' : `<span class="drag-handle" aria-label="拖曳調整順序" role="button" tabindex="0">${ICON.grip}</span>`}</div>`).join('')
+      : '<div class="empty">找不到卡片</div>';
     bindListItems();
+    if (!k) enableDrag(list);
   };
   q.addEventListener('input', draw);
   draw();
+}
+
+function enableDrag(list) {
+  list.querySelectorAll('.drag-handle').forEach((handle) => {
+    handle.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      const row = handle.closest('.sort-row');
+      row.classList.add('dragging');
+      const pid = e.pointerId;
+      let scrollTimer = null;
+
+      // 監聽整個視窗：卡片在清單裡移位時，瀏覽器會中斷對把手的追蹤
+      const move = (ev) => {
+        if (ev.pointerId !== pid) return;
+        const y = ev.clientY;
+        // 拖到畫面邊緣時自動捲動
+        clearInterval(scrollTimer);
+        if (y < 90) scrollTimer = setInterval(() => window.scrollBy(0, -8), 16);
+        else if (y > window.innerHeight - 90) scrollTimer = setInterval(() => window.scrollBy(0, 8), 16);
+        for (const other of list.querySelectorAll('.sort-row:not(.dragging)')) {
+          const r = other.getBoundingClientRect();
+          if (y >= r.top && y <= r.bottom) {
+            if (y < r.top + r.height / 2) list.insertBefore(row, other);
+            else list.insertBefore(row, other.nextSibling);
+            break;
+          }
+        }
+      };
+      const up = (ev) => {
+        if (ev.pointerId !== pid) return;
+        clearInterval(scrollTimer);
+        row.classList.remove('dragging');
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        window.removeEventListener('pointercancel', up);
+        const ids = Array.from(list.querySelectorAll('.sort-row')).map((x) => x.dataset.id);
+        ids.forEach((id, i) => { const c = getCard(id); if (c) c.order = i; });
+        saveCards();
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+      window.addEventListener('pointercancel', up);
+    });
+  });
 }
 
 /* ========== 新增／編輯卡片 ========== */
@@ -865,7 +923,7 @@ document.addEventListener('click', (e) => {
 
 function viewListen() {
   document.body.classList.add('dark');
-  const list = cards.slice().sort((a, b) => b.created - a.created).map((c) => c.id);
+  const list = orderedCards().map((c) => c.id);
   player = { list, index: 0, enDone: 0, phase: 'idle', token: null, needTap: false };
   leaveView = () => { stopPlayer(); releaseScreen(); };
   drawListen();
