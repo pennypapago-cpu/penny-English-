@@ -184,3 +184,15 @@ body.dark #app { color: #fff; }
 }
 .paste-zone:empty::before { content: attr(data-placeholder); pointer-events: none; }
 .paste-zone:focus { border-color: var(--accent); }
+
+/* 拖曳排序 */
+.sort-row { display: flex; align-items: stretch; gap: 6px; }
+.sort-row .list-item { flex: 1; min-width: 0; }
+.drag-handle {
+  width: 48px; flex-shrink: 0; border-radius: 14px; background: var(--card);
+  display: flex; align-items: center; justify-content: center; color: var(--muted);
+  touch-action: none; cursor: grab; -webkit-user-select: none; user-select: none;
+}
+.drag-handle svg { width: 22px; height: 22px; }
+.sort-row.dragging { opacity: 0.9; transform: scale(1.02); box-shadow: 0 8px 24px rgba(27,36,48,0.18); border-radius: 14px; position: relative; z-index: 2; }
+.sort-row.dragging .drag-handle { background: var(--accent); color: #fff; cursor: grabbing; }
