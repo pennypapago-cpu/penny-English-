@@ -660,27 +660,73 @@ function viewEdit(id, params) {
 
 /* ========== 找解釋和例句 ========== */
 
-// 免費線上字典（Free Dictionary API，不用帳號）；有些字查不到例句
-async function lookupWord(word) {
+// 免費線上字典：先查維基詞典（Wiktionary），查不到或連不上再查 Free Dictionary
+async function fetchJSON(url, ms) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 8000);
+  const timer = setTimeout(() => ctrl.abort(), ms);
   try {
-    const res = await fetch('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word), { signal: ctrl.signal });
-    if (res.status === 404) return { found: false, defs: [], examples: [] };
+    const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json' } });
+    if (res.status === 404) return null;
     if (!res.ok) throw new Error('http ' + res.status);
-    const data = await res.json();
-    const out = { found: true, phonetic: '', defs: [], examples: [] };
-    (Array.isArray(data) ? data : []).forEach((entry) => {
-      if (!out.phonetic) out.phonetic = entry.phonetic || (entry.phonetics || []).map((x) => x.text).find(Boolean) || '';
-      (entry.meanings || []).forEach((m) => (m.definitions || []).forEach((d) => {
-        if (out.defs.length < 4 && d.definition) out.defs.push({ pos: m.partOfSpeech || '', text: d.definition });
-        if (d.example && out.examples.length < 6 && !out.examples.some((e) => e.en === d.example)) out.examples.push({ en: d.example, zh: '' });
-      }));
-    });
-    return out;
+    return await res.json();
   } finally {
     clearTimeout(timer);
   }
+}
+
+function htmlToText(html) {
+  const doc = new DOMParser().parseFromString('<div>' + (html || '') + '</div>', 'text/html');
+  return doc.body.textContent.replace(/\s+/g, ' ').trim();
+}
+
+async function lookupWiktionary(word) {
+  const title = word.trim().replace(/\s+/g, '_');
+  let data = await fetchJSON('https://en.wiktionary.org/api/rest_v1/page/definition/' + encodeURIComponent(title), 10000);
+  // 維基詞典區分大小寫，句首大寫的字再用小寫查一次
+  if (!data && title !== title.toLowerCase()) data = await fetchJSON('https://en.wiktionary.org/api/rest_v1/page/definition/' + encodeURIComponent(title.toLowerCase()), 10000);
+  const entries = (data && data.en) || [];
+  if (!entries.length) return null;
+  const out = { found: true, phonetic: '', defs: [], examples: [], source: 'Wiktionary' };
+  entries.forEach((e) => (e.definitions || []).forEach((d) => {
+    const text = htmlToText(d.definition);
+    if (text && out.defs.length < 4) out.defs.push({ pos: (e.partOfSpeech || '').toLowerCase(), text });
+    const exs = (d.parsedExamples || []).map((x) => x.example).concat(d.examples || []);
+    exs.forEach((ex) => {
+      const t = htmlToText(ex);
+      // 只留短句，跳過長篇的文學引文
+      if (t && t.length <= 140 && out.examples.length < 6 && !out.examples.some((x) => x.en === t)) out.examples.push({ en: t, zh: '' });
+    });
+  }));
+  return out.defs.length ? out : null;
+}
+
+async function lookupFreeDictionary(word) {
+  const data = await fetchJSON('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word), 10000);
+  if (!Array.isArray(data)) return null;
+  const out = { found: true, phonetic: '', defs: [], examples: [], source: 'Free Dictionary' };
+  data.forEach((entry) => {
+    if (!out.phonetic) out.phonetic = entry.phonetic || (entry.phonetics || []).map((x) => x.text).find(Boolean) || '';
+    (entry.meanings || []).forEach((m) => (m.definitions || []).forEach((d) => {
+      if (out.defs.length < 4 && d.definition) out.defs.push({ pos: m.partOfSpeech || '', text: d.definition });
+      if (d.example && out.examples.length < 6 && !out.examples.some((e) => e.en === d.example)) out.examples.push({ en: d.example, zh: '' });
+    }));
+  });
+  return out.defs.length ? out : null;
+}
+
+// 回傳 { found, ... }；兩個來源都連不上才丟出錯誤
+async function lookupWord(word) {
+  let networkFailures = 0;
+  for (const source of [lookupWiktionary, lookupFreeDictionary]) {
+    try {
+      const r = await source(word);
+      if (r) return r;
+    } catch (e) {
+      networkFailures++;
+    }
+  }
+  if (networkFailures === 2) throw new Error('offline');
+  return { found: false, defs: [], examples: [] };
 }
 
 function buildExamplePrompt(word) {
@@ -763,13 +809,13 @@ function bindLookup($) {
     try { result = await lookupWord(word); } catch (e) { failed = true; }
 
     let html = '';
-    if (failed) html += '<span class="muted">連不上線上字典（可能沒有網路）。可以改用下面的 Claude。</span>';
+    if (failed) html += '<span class="muted">兩個線上字典都連不上（可能網路不穩）。可以等一下再按一次，或改用下面的 Claude。</span>';
     else if (!result.found) html += `<span class="muted">字典裡查不到「${esc(word)}」。片語或句子可以改用下面的 Claude。</span>`;
     else {
       html += `<div class="row" style="gap:10px"><strong style="font-size:18px">${esc(word)}</strong>${result.phonetic ? `<span class="muted">${esc(result.phonetic)}</span>` : ''}</div>`;
       html += result.defs.map((d) => `<div style="font-size:14px"><span class="tag grey">${esc(d.pos)}</span> ${esc(d.text)}</div>`).join('');
       html += result.examples.length
-        ? '<span class="muted" style="margin-top:6px">字典例句</span>' + exampleList(result.examples, 'Free Dictionary')
+        ? `<span class="muted" style="margin-top:6px">字典例句（${esc(result.source)}）</span>` + exampleList(result.examples, result.source)
         : '<span class="muted">字典沒有這個字的例句。</span>';
     }
     html += claudePart(word);
