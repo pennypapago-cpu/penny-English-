@@ -1,5 +1,5 @@
 // 離線快取：先用網路拿最新版，失敗時（沒網路）才用快取
-const CACHE = 'english-cards-v1';
+const CACHE = 'english-cards-v2';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -16,8 +16,9 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET' || new URL(e.request.url).origin !== location.origin) return;
+  // cache: 'no-cache'：每次都向網站確認有沒有新版，不用瀏覽器的舊暫存
   e.respondWith(
-    fetch(e.request)
+    fetch(e.request, { cache: 'no-cache' })
       .then((res) => {
         const copy = res.clone();
         caches.open(CACHE).then((c) => c.put(e.request, copy));
