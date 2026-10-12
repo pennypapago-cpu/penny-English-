@@ -56,6 +56,92 @@ function upsertCard(card) {
 function deleteCard(id) {
   cards = cards.filter((c) => c.id !== id);
   saveCards();
+  imgDel(id);
+}
+
+/* ========== 圖片（存在 IndexedDB，空間比 localStorage 大很多） ========== */
+
+let imgDbPromise = null;
+function imgDb() {
+  if (!imgDbPromise) {
+    imgDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open('ec-images', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('images');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return imgDbPromise;
+}
+async function imgTx(mode, fn) {
+  const db = await imgDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('images', mode);
+    const req = fn(tx.objectStore('images'));
+    tx.oncomplete = () => resolve(req && req.result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+const imgCache = {}; // 讀過的圖片留在記憶體，畫面重畫時不會閃
+async function imgGet(id) {
+  if (imgCache[id]) return imgCache[id];
+  const d = await imgTx('readonly', (st) => st.get(id)).catch(() => null);
+  if (d) imgCache[id] = d;
+  return d;
+}
+function imgPut(id, dataUrl) {
+  imgCache[id] = dataUrl;
+  return imgTx('readwrite', (st) => st.put(dataUrl, id));
+}
+function imgDel(id) {
+  delete imgCache[id];
+  return imgTx('readwrite', (st) => st.delete(id)).catch(() => {});
+}
+async function imgAll() {
+  const out = {};
+  for (const c of cards) {
+    if (!c.hasImage) continue;
+    const d = await imgGet(c.id);
+    if (d) out[c.id] = d;
+  }
+  return out;
+}
+
+// 把照片縮小再存（最長邊 900px），一張大約 100KB 上下
+function shrinkImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = () => {
+      const scale = Math.min(1, 900 / Math.max(im.width, im.height));
+      const cv = document.createElement('canvas');
+      cv.width = Math.round(im.width * scale);
+      cv.height = Math.round(im.height * scale);
+      const ctx = cv.getContext('2d');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.drawImage(im, 0, 0, cv.width, cv.height);
+      URL.revokeObjectURL(url);
+      resolve(cv.toDataURL('image/jpeg', 0.8));
+    };
+    im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('bad image')); };
+    im.src = url;
+  });
+}
+
+// 畫面畫好後，把 <img data-img="卡片id"> 補上圖片
+function loadImages(root) {
+  (root || app).querySelectorAll('img[data-img]').forEach(async (el) => {
+    const d = await imgGet(el.dataset.img);
+    if (d) { el.src = d; el.hidden = false; }
+  });
+}
+function cardImage(card, cls) {
+  if (!card || !card.hasImage) return '';
+  const cached = imgCache[card.id];
+  return cached
+    ? `<img class="${cls}" src="${cached}" alt="${esc(card.en)} 的圖片">`
+    : `<img class="${cls}" data-img="${esc(card.id)}" alt="${esc(card.en)} 的圖片" hidden>`;
 }
 
 function blankCard(type) {
@@ -332,7 +418,7 @@ function viewHome() {
 function listItem(c) {
   const tagClass = c.type === 'sentence' ? 'tag sentence' : 'tag';
   return `<button class="list-item" data-id="${esc(c.id)}">
-    <span class="row"><span class="en">${esc(c.en || '（未填英文）')}</span><span class="${tagClass}">${TYPE_LABEL[c.type] || '單字'}</span>${c.flagged ? '<span class="tag grey">不熟</span>' : ''}</span>
+    <span class="row"><span class="en">${esc(c.en || '（未填英文）')}</span><span class="${tagClass}">${TYPE_LABEL[c.type] || '單字'}</span>${c.hasImage ? '<span class="tag grey">圖</span>' : ''}${c.flagged ? '<span class="tag grey">不熟</span>' : ''}</span>
     <span class="sub">${esc(c.zh)}${c.source ? '・' + esc(c.source) : ''}</span>
   </button>`;
 }
@@ -399,6 +485,17 @@ function viewEdit(id, params) {
       </span>
     </label>
 
+    <div class="field">圖片（幫助記憶）
+      <div class="img-slot" id="img-slot">
+        <img id="img-preview" class="card-img" alt="卡片圖片預覽" hidden>
+        <div id="paste-zone" class="paste-zone" contenteditable="true" role="textbox" aria-label="貼上圖片的地方" data-placeholder="長按這裡 → 貼上圖片"></div>
+        <div class="row">
+          <label class="btn ghost" style="flex:1;cursor:pointer;min-height:44px;font-size:15px">從相簿選擇<input type="file" id="img-file" accept="image/*" hidden></label>
+          <button type="button" class="btn danger" id="img-remove" style="min-height:44px;font-size:15px" hidden>移除圖片</button>
+        </div>
+      </div>
+    </div>
+
     <label class="field">看到的原句（上下文）
       <textarea id="context">${esc(card.context)}</textarea>
     </label>
@@ -426,6 +523,34 @@ function viewEdit(id, params) {
   }));
   micButton($('#mic-en'), 'en', (t) => { $('#en').value = t; });
   micButton($('#mic-zh'), 'zh', (t) => { $('#zh').value = t; });
+
+  // 圖片：undefined = 沒動、null = 移除、字串 = 新圖片
+  let newImage;
+  const showImage = (d) => {
+    $('#img-preview').hidden = !d;
+    if (d) $('#img-preview').src = d;
+    $('#img-remove').hidden = !d;
+    $('#paste-zone').dataset.placeholder = d ? '長按這裡 → 貼上換一張' : '長按這裡 → 貼上圖片';
+  };
+  const takeImage = async (file) => {
+    try {
+      newImage = await shrinkImage(file);
+      showImage(newImage);
+    } catch (e) {
+      toast('這張圖片讀不出來，換一張試試');
+    }
+  };
+  if (card.hasImage) imgGet(card.id).then((d) => { if (d && newImage === undefined) showImage(d); });
+  $('#img-file').addEventListener('change', (e) => { if (e.target.files[0]) takeImage(e.target.files[0]); e.target.value = ''; });
+  $('#img-remove').addEventListener('click', () => { newImage = null; showImage(null); });
+  $('#paste-zone').addEventListener('paste', (e) => {
+    e.preventDefault();
+    const item = Array.from((e.clipboardData && e.clipboardData.items) || []).find((x) => x.type.startsWith('image/'));
+    if (item) takeImage(item.getAsFile());
+    else toast('剪貼簿裡沒有圖片。先在相簿或網頁長按圖片 → 拷貝');
+    e.target.textContent = '';
+  });
+  $('#paste-zone').addEventListener('input', (e) => { e.target.textContent = ''; });
   $('#say-en').addEventListener('click', () => { stopSpeaking(); speak($('#en').value.trim(), 'en', settings.enRate); });
 
   $('#save').addEventListener('click', () => {
@@ -436,6 +561,8 @@ function viewEdit(id, params) {
     card.note = $('#note').value.trim();
     card.flagged = $('#flagged').checked;
     if (!card.en) { toast('請先填英文'); return; }
+    if (newImage) { card.hasImage = true; imgPut(card.id, newImage).catch(() => toast('圖片儲存失敗')); }
+    else if (newImage === null) { card.hasImage = false; imgDel(card.id); }
     upsertCard(card);
     toast(existing ? '已儲存' : '已新增，今天就會出現在複習裡');
     if (existing) go(back);
@@ -512,6 +639,7 @@ function drawReview() {
         <a class="btn ghost" style="min-height:36px;font-size:13px;padding:0 12px" href="#edit/${esc(card.id)}?back=${back}">${ICON.edit}編輯</a>
       </div>
       <span class="muted">${askZh ? '請用英文說：' : '這是什麼意思？'}</span>
+      ${cardImage(card, 'card-img')}
       <div class="prompt-zh">${esc(askZh ? card.zh : card.en)}</div>
     </section>
 
@@ -548,6 +676,7 @@ function drawReview() {
       </div>` : `<button class="btn secondary" id="reveal">看答案</button>`}
   `;
 
+  loadImages();
   const $ = (s) => app.querySelector(s);
   if ($('#reveal')) $('#reveal').addEventListener('click', () => {
     review.revealed = true;
@@ -758,6 +887,7 @@ function drawListen() {
       </div>
       ${card ? `
         <div class="stack" style="gap:24px;flex-grow:1;justify-content:center">
+          ${cardImage(card, 'card-img listen-img')}
           <div class="stack"><span class="label">中文</span><div class="zh">${esc(card.zh || '（沒有中文）')}</div></div>
           <div class="stack" style="gap:10px">
             <span class="label">英文${p.phase === 'en' ? '・第 ' + Math.min(p.enDone + 1, settings.enTimes) + ' 次' : ''}</span>
@@ -772,6 +902,7 @@ function drawListen() {
   `;
 
   // 備援：如果手機擋住了自動朗讀，點畫面任何地方就重新開始
+  loadImages();
   const box = app.querySelector('#listen');
   if (card) box.addEventListener('click', (e) => {
     if (e.target.closest('a')) return;
@@ -856,8 +987,9 @@ function viewSettings() {
     </section>
   `;
   const $ = (s) => app.querySelector(s);
-  $('#export').addEventListener('click', () => {
-    const data = JSON.stringify({ app: 'english-cards', version: 1, exported: Date.now(), cards }, null, 1);
+  $('#export').addEventListener('click', async () => {
+    const images = await imgAll();
+    const data = JSON.stringify({ app: 'english-cards', version: 2, exported: Date.now(), cards, images }, null, 1);
     const blob = new Blob([data], { type: 'application/json' });
     const a = document.createElement('a');
     const d = new Date();
@@ -888,6 +1020,13 @@ function viewSettings() {
         if (!cur) { cards.push(Object.assign(blankCard(c.type), c)); added++; }
         else if ((c.updated || 0) > (cur.updated || 0)) { Object.assign(cur, c); updated++; }
       });
+      const imgs = (data && data.images) || {};
+      for (const id of Object.keys(imgs)) {
+        if (getCard(id) && typeof imgs[id] === 'string' && imgs[id].startsWith('data:image/')) {
+          await imgPut(id, imgs[id]);
+          imgCache[id] = imgs[id];
+        }
+      }
       saveCards();
       toast(`匯入完成：新增 ${added} 張，更新 ${updated} 張`);
       viewSettings();

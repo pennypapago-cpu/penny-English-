@@ -172,3 +172,15 @@ body.dark #app { color: #fff; }
   opacity: 0; pointer-events: none; transition: opacity .2s; max-width: calc(100% - 32px); text-align: center;
 }
 #toast.show { opacity: 1; }
+
+/* 圖片 */
+.card-img { width: 100%; max-height: 280px; object-fit: contain; border-radius: 12px; background: #fff; display: block; }
+.listen-img { max-height: 38vh; background: transparent; }
+.img-slot { display: flex; flex-direction: column; gap: 8px; }
+.paste-zone {
+  min-height: 64px; border: 2px dashed var(--line); border-radius: 12px; background: var(--card);
+  display: flex; align-items: center; justify-content: center; font-size: 15px; font-weight: 400;
+  color: var(--muted); padding: 12px; -webkit-user-select: text; user-select: text; outline: none;
+}
+.paste-zone:empty::before { content: attr(data-placeholder); pointer-events: none; }
+.paste-zone:focus { border-color: var(--accent); }
