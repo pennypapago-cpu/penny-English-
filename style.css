@@ -14,6 +14,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   background: var(--bg);
@@ -196,3 +197,7 @@ body.dark #app { color: #fff; }
 .drag-handle svg { width: 22px; height: 22px; }
 .sort-row.dragging { opacity: 0.9; transform: scale(1.02); box-shadow: 0 8px 24px rgba(27,36,48,0.18); border-radius: 14px; position: relative; z-index: 2; }
 .sort-row.dragging .drag-handle { background: var(--accent); color: #fff; cursor: grabbing; }
+
+/* 例句清單 */
+.ex-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); }
+.ex-row .icon-btn { width: 40px; height: 40px; }

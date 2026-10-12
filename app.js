@@ -338,6 +338,7 @@ const ICON = {
   pause: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>',
   prev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 5v14M19 5L9 12l10 7V5z"/></svg>',
   grip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 8h14M5 12h14M5 16h14"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>',
   next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 5v14M5 5l10 7-10 7V5z"/></svg>',
 };
 
@@ -535,6 +536,8 @@ function viewEdit(id, params) {
         <button type="button" class="icon-btn" id="say-en" aria-label="播放英文發音">${ICON.speaker}</button>
       </span>
     </label>
+    <button type="button" class="btn secondary" id="lookup" style="min-height:46px;font-size:15px">${ICON.search}找解釋和生活例句</button>
+    <div id="lookup-box" class="stack" hidden></div>
 
     <label class="field">中文意思
       <span class="field-row">
@@ -554,8 +557,11 @@ function viewEdit(id, params) {
       </div>
     </div>
 
-    <label class="field">看到的原句（上下文）
-      <textarea id="context">${esc(card.context)}</textarea>
+    <label class="field">例句／看到的原句
+      <span class="field-row">
+        <textarea id="context">${esc(card.context)}</textarea>
+        <button type="button" class="icon-btn" id="say-ctx" aria-label="播放例句發音">${ICON.speaker}</button>
+      </span>
     </label>
 
     <label class="field">出處
@@ -581,6 +587,8 @@ function viewEdit(id, params) {
   }));
   micButton($('#mic-en'), 'en', (t) => { $('#en').value = t; });
   micButton($('#mic-zh'), 'zh', (t) => { $('#zh').value = t; });
+  $('#say-ctx').addEventListener('click', () => { stopSpeaking(); speak($('#context').value.trim(), 'en', settings.enRate); });
+  bindLookup($);
 
   // 圖片：undefined = 沒動、null = 移除、字串 = 新圖片
   let newImage;
@@ -636,6 +644,133 @@ function viewEdit(id, params) {
       go(back);
     });
   }
+}
+
+/* ========== 找解釋和例句 ========== */
+
+// 免費線上字典（Free Dictionary API，不用帳號）；有些字查不到例句
+async function lookupWord(word) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word), { signal: ctrl.signal });
+    if (res.status === 404) return { found: false, defs: [], examples: [] };
+    if (!res.ok) throw new Error('http ' + res.status);
+    const data = await res.json();
+    const out = { found: true, phonetic: '', defs: [], examples: [] };
+    (Array.isArray(data) ? data : []).forEach((entry) => {
+      if (!out.phonetic) out.phonetic = entry.phonetic || (entry.phonetics || []).map((x) => x.text).find(Boolean) || '';
+      (entry.meanings || []).forEach((m) => (m.definitions || []).forEach((d) => {
+        if (out.defs.length < 4 && d.definition) out.defs.push({ pos: m.partOfSpeech || '', text: d.definition });
+        if (d.example && out.examples.length < 6 && !out.examples.some((e) => e.en === d.example)) out.examples.push({ en: d.example, zh: '' });
+      }));
+    });
+    return out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildExamplePrompt(word) {
+  return `請給我 3 個使用「${word}」的日常生活英文例句，要簡短自然、真的會在生活中聽到的說法。
+每句一行，格式：英文例句｜繁體中文翻譯
+不要加編號、符號或其他說明。`;
+}
+
+function parseExamples(text) {
+  return text.split(/\n+/).map((line) => line.replace(/[*_#>`]/g, '').replace(/^\s*\d+[.)、]\s*/, '').trim())
+    .map((line) => {
+      const parts = line.split(/\s*[｜|]\s*/);
+      return parts.length >= 2 && /[a-z]/i.test(parts[0]) ? { en: parts[0].trim(), zh: parts.slice(1).join(' ').trim() } : null;
+    })
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+// 編輯畫面上的「找解釋和生活例句」
+function bindLookup($) {
+  const box = $('#lookup-box');
+  let examples = [];
+
+  const useExample = (ex, source) => {
+    $('#context').value = ex.en;
+    fitTextarea($('#context'));
+    if (ex.zh) {
+      const note = $('#note');
+      const line = '例句翻譯：' + ex.zh;
+      if (!note.value.includes(line)) note.value = note.value ? line + '\n\n' + note.value : line;
+      fitTextarea(note);
+    }
+    const src = $('#source').value.trim();
+    if (!src || src === 'Free Dictionary' || src === 'Claude 生活例句') $('#source').value = source;
+    toast('已放進「例句」欄');
+  };
+
+  const exampleList = (list, source) => list.map((ex, i) => `
+    <div class="ex-row" data-i="${i}" data-src="${esc(source)}">
+      <div style="flex:1;min-width:0"><div style="font-size:16px">${esc(ex.en)}</div>${ex.zh ? `<div class="muted">${esc(ex.zh)}</div>` : ''}</div>
+      <button type="button" class="icon-btn ex-say" aria-label="播放這個例句">${ICON.speaker}</button>
+      <button type="button" class="btn ghost ex-use" style="min-height:44px;font-size:14px;padding:0 12px">用這句</button>
+    </div>`).join('');
+
+  const bindRows = (root, list) => {
+    root.querySelectorAll('.ex-row').forEach((row) => {
+      const ex = list[Number(row.dataset.i)];
+      row.querySelector('.ex-say').addEventListener('click', () => { stopSpeaking(); speak(ex.en, 'en', settings.enRate); });
+      row.querySelector('.ex-use').addEventListener('click', () => useExample(ex, row.dataset.src));
+    });
+  };
+
+  const claudePart = (word) => `
+    <div class="stack" style="border-top:1px solid var(--line);padding-top:12px">
+      <span class="muted">想要更生活化的例句？請 Claude 寫幾句，再把回答整段貼回來：</span>
+      <button type="button" class="btn ghost" id="ask-ex" style="min-height:44px;font-size:15px">${ICON.copy}複製問題並打開 Claude</button>
+      <textarea id="ex-paste" placeholder="長按這裡 → 貼上 Claude 的回答" aria-label="貼上 Claude 給的例句" style="min-height:70px"></textarea>
+      <div class="stack" id="ex-claude"></div>
+    </div>`;
+
+  const bindClaude = (word) => {
+    $('#ask-ex').addEventListener('click', async () => {
+      const prompt = buildExamplePrompt(word);
+      const copying = copyText(prompt);
+      window.open('https://claude.ai/new?q=' + encodeURIComponent(prompt), '_blank');
+      toast((await copying) ? '已複製，如果 Claude 沒有自動帶入，貼上後送出' : '複製失敗，請手動複製');
+    });
+    $('#ex-paste').addEventListener('input', (e) => {
+      examples = parseExamples(e.target.value);
+      const out = $('#ex-claude');
+      out.innerHTML = e.target.value.trim() && !examples.length
+        ? '<span class="muted">看不懂這段格式，可以直接把例句貼到下面的「例句」欄。</span>'
+        : exampleList(examples, 'Claude 生活例句');
+      bindRows(out, examples);
+    });
+  };
+
+  $('#lookup').addEventListener('click', async () => {
+    const word = $('#en').value.trim();
+    if (!word) { toast('請先輸入英文'); return; }
+    box.hidden = false;
+    box.className = 'card stack';
+    box.innerHTML = '<span class="muted">查詢中…</span>';
+    let result = null;
+    let failed = false;
+    try { result = await lookupWord(word); } catch (e) { failed = true; }
+
+    let html = '';
+    if (failed) html += '<span class="muted">連不上線上字典（可能沒有網路）。可以改用下面的 Claude。</span>';
+    else if (!result.found) html += `<span class="muted">字典裡查不到「${esc(word)}」。片語或句子可以改用下面的 Claude。</span>`;
+    else {
+      html += `<div class="row" style="gap:10px"><strong style="font-size:18px">${esc(word)}</strong>${result.phonetic ? `<span class="muted">${esc(result.phonetic)}</span>` : ''}</div>`;
+      html += result.defs.map((d) => `<div style="font-size:14px"><span class="tag grey">${esc(d.pos)}</span> ${esc(d.text)}</div>`).join('');
+      html += result.examples.length
+        ? '<span class="muted" style="margin-top:6px">字典例句</span>' + exampleList(result.examples, 'Free Dictionary')
+        : '<span class="muted">字典沒有這個字的例句。</span>';
+    }
+    html += claudePart(word);
+    box.innerHTML = html;
+    if (result && result.examples.length) bindRows(box, result.examples);
+    bindClaude(word);
+  });
 }
 
 /* ========== 每日複習 ========== */
@@ -714,7 +849,7 @@ function drawReview() {
         </div>
         <div class="answer-en">${esc(card.en)}</div>
         ${!askZh && card.zh ? `<div>${esc(card.zh)}</div>` : ''}
-        ${card.context ? `<div style="font-size:14px">原句：${esc(card.context)}</div>` : ''}
+        ${card.context ? `<div class="row" style="align-items:flex-start;gap:10px"><div style="font-size:15px;flex:1;white-space:pre-line">例句：${esc(card.context)}</div><button class="icon-btn" id="play-ctx" aria-label="播放例句" style="width:40px;height:40px">${ICON.speaker}</button></div>` : ''}
         ${card.source ? `<div style="font-size:13px">出處：${esc(card.source)}</div>` : ''}
         ${card.note ? `<div style="font-size:15px;line-height:1.6;white-space:pre-line;border-top:1px solid rgba(15,62,62,0.2);padding-top:8px">${esc(card.note)}</div>` : ''}
       </section>` : ''}
@@ -743,6 +878,7 @@ function drawReview() {
   });
   if ($('#play')) $('#play').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', settings.enRate); });
   if ($('#slow')) $('#slow').addEventListener('click', () => { stopSpeaking(); speak(card.en, 'en', 0.6); });
+  if ($('#play-ctx')) $('#play-ctx').addEventListener('click', () => { stopSpeaking(); speak(card.context, 'en', settings.enRate); });
   if ($('#speak')) micButton($('#speak'), 'en', (t) => {
     const firstTry = !review.revealed;
     review.said = t;
